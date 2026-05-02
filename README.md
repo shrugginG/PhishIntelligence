@@ -57,7 +57,7 @@ Set these in repo settings → Secrets and variables → Actions:
 
 | Secret | Used by | Purpose |
 |---|---|---|
-| `SUPABASE_DB_URL` | all | Postgres connection string (service role) |
+| `SUPABASE_DB_URL` | all | Postgres connection string — **must be the Session Pooler URL, not direct connection**. Free tier direct connection is IPv6-only and unreachable from GitHub Actions runners. Get the pooler URL from Supabase Dashboard → Database → Connection pooling → Session mode. |
 | `PHISHTANK_TOKEN` | fetch_phishtank | PhishTank bulk dump API key |
 | `ECRIMEX_TOKEN` | fetch_ecrimex | eCrimeX `/api/v1` Bearer token |
 | `OPENPHISH_GITHUB_USER` | fetch_openphish_academic | GitHub username for academic clone |

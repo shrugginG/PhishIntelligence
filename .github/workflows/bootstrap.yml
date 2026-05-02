@@ -1,0 +1,68 @@
+name: Bootstrap (manual)
+
+# Manually triggered only — pulls latest N items from each chosen source,
+# upserts to raw_* tables (which auto-derive phishing_urls via triggers),
+# then optionally marks all newly-ingested phishing_urls rows as 'stale'.
+#
+# Sizes default to 100 per source; override per run as needed.
+# Pass "all" to fetch the full source-end window (varies per source —
+# see README / CLAUDE.md for source data shapes).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: 'Comma-separated sources, or "all"'
+        default: 'all'
+        required: true
+      phishtank_size:
+        description: 'PhishTank: N or "all" (full bulk dump ~58K)'
+        default: '100'
+      openphish_academic_size:
+        description: 'OpenPhish Academic: N or "all" (~28K from 30-day archive)'
+        default: '100'
+      openphish_community_size:
+        description: 'OpenPhish Community: N or "all" (max 300)'
+        default: '100'
+      ecrimex_size:
+        description: 'eCrimeX: N or "all" (~10K via API pagination)'
+        default: '100'
+      phishstats_size:
+        description: 'PhishStats: N or "all" (rate-limited 20 req/min)'
+        default: '100'
+      mark_stale:
+        description: 'Mark bootstrap data as crawl_status=stale (recommended)'
+        type: boolean
+        default: true
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run bootstrap
+        run: |
+          uv run python -m src.bootstrap \
+            --sources "${{ inputs.sources }}" \
+            --phishtank-size "${{ inputs.phishtank_size }}" \
+            --openphish-academic-size "${{ inputs.openphish_academic_size }}" \
+            --openphish-community-size "${{ inputs.openphish_community_size }}" \
+            --ecrimex-size "${{ inputs.ecrimex_size }}" \
+            --phishstats-size "${{ inputs.phishstats_size }}" \
+            ${{ inputs.mark_stale == true && '--mark-stale' || '--no-mark-stale' }}
+        env:
+          SUPABASE_DB_URL:        ${{ secrets.SUPABASE_DB_URL }}
+          PHISHTANK_TOKEN:        ${{ secrets.PHISHTANK_TOKEN }}
+          ECRIMEX_TOKEN:          ${{ secrets.ECRIMEX_TOKEN }}
+          OPENPHISH_GITHUB_USER:  ${{ secrets.OPENPHISH_GITHUB_USER }}
+          OPENPHISH_GITHUB_PAT:   ${{ secrets.OPENPHISH_GITHUB_PAT }}
