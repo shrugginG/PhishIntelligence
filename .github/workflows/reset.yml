@@ -1,0 +1,36 @@
+name: Reset (manual, destructive)
+
+# Manually triggered only — wipes all phishing intelligence tables.
+# Two safety nets:
+#   1. workflow_dispatch is the only trigger (no cron, no push)
+#   2. The `if:` condition requires the user to type "WIPE-ALL" exactly
+#      Anything else and the job is skipped before any runner is allocated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "WIPE-ALL" to confirm. Anything else aborts.'
+        required: true
+        default: ''
+
+jobs:
+  reset:
+    if: ${{ inputs.confirm == 'WIPE-ALL' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: TRUNCATE all tables
+        run: uv run python -m src.reset
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
