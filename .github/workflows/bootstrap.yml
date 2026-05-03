@@ -1,18 +1,27 @@
 name: Bootstrap (manual)
 
-# Manually triggered only — pulls latest N items from each chosen source,
-# upserts to raw_* tables (which auto-derive phishing_urls via triggers),
-# then optionally marks all newly-ingested phishing_urls rows as 'stale'.
+# Manually triggered only — pulls latest N items from each chosen target,
+# upserts to raw_* tables (which auto-derive phishing_urls via triggers,
+# which in turn auto-derive vt_url_reports via another trigger),
+# then optionally marks all newly-ingested phishing_urls / vt_url_reports
+# rows as 'stale' (default on).
 #
-# Sizes default to 100 per source; override per run as needed.
-# Pass "all" to fetch the full source-end window (varies per source —
-# see README / CLAUDE.md for source data shapes).
+# Targets fall in two flavors:
+#   - Source targets (raw fetchers, hit external HTTP): phishtank,
+#     openphish_academic, openphish_community, ecrimex, phishstats —
+#     bounded by per-source sizes below
+#   - Derived-table targets (internal SQL only): vt — registers every
+#     existing phishing_urls row in vt_url_reports
+#
+# Sizes default to 100 per source; pass "all" to fetch the full source-end
+# window (varies per source — see README / CLAUDE.md). Sizes do not apply
+# to derived-table targets.
 
 on:
   workflow_dispatch:
     inputs:
-      sources:
-        description: 'Comma-separated sources, or "all"'
+      targets:
+        description: 'Comma-separated targets, or "all". Valid: phishtank, openphish_academic, openphish_community, ecrimex, phishstats, vt, all'
         default: 'all'
         required: true
       phishtank_size:
@@ -31,7 +40,7 @@ on:
         description: 'PhishStats: N or "all" (rate-limited 20 req/min)'
         default: '100'
       mark_stale:
-        description: 'Mark bootstrap data as crawl_status=stale (recommended)'
+        description: 'Mark bootstrap data as stale in both phishing_urls and vt_url_reports (recommended)'
         type: boolean
         default: true
 
@@ -53,7 +62,7 @@ jobs:
       - name: Run bootstrap
         run: |
           uv run python -m src.bootstrap \
-            --sources "${{ inputs.sources }}" \
+            --targets "${{ inputs.targets }}" \
             --phishtank-size "${{ inputs.phishtank_size }}" \
             --openphish-academic-size "${{ inputs.openphish_academic_size }}" \
             --openphish-community-size "${{ inputs.openphish_community_size }}" \

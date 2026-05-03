@@ -12,8 +12,9 @@ Behavior:
 
 from src.shared.db import get_connection
 
-# Order doesn't matter for TRUNCATE since we use a single statement,
-# but we list registry-side tables last for log readability.
+# Order doesn't matter for TRUNCATE since we use a single statement
+# (CASCADE handles FK ordering); listed roughly bottom-up for log readability:
+# raw_* leaves first, then phishing_urls (the hub), then derived-table reports.
 TABLES = [
     "raw_phishtank",
     "raw_openphish_academic",
@@ -21,6 +22,7 @@ TABLES = [
     "raw_ecrimex",
     "raw_phishstats",
     "phishing_urls",
+    "vt_url_reports",
 ]
 
 
