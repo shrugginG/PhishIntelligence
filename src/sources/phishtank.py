@@ -82,3 +82,31 @@ def bootstrap_fetch(size: int | None) -> int:
     affected = _upsert(selected)
     print(f"  Upsert affected {affected} rows")
     return affected
+
+
+def _get_anchor() -> int:
+    """Returns the largest phish_id we already have, or 0 if raw_phishtank is empty."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(MAX(phish_id), 0) FROM raw_phishtank")
+        return cur.fetchone()[0]
+
+
+def routine_fetch() -> int:
+    """Incremental fetch: pull the bulk dump, keep only entries with
+    phish_id > current MAX, upsert. Application-layer filter on phish_id
+    (NOT short-circuit) because PhishTank dump is not strictly monotonic
+    by phish_id — see CLAUDE.md / design docs for rationale.
+    """
+    anchor = _get_anchor()
+    print(f"  Anchor: phish_id > {anchor}")
+    records = _fetch_dump()
+    new = [r for r in records if r["phish_id"] > anchor]
+    print(f"  New entries beyond anchor: {len(new)} (out of {len(records)} dump rows)")
+    affected = _upsert(new)
+    print(f"  Upsert affected {affected} rows")
+    return affected
+
+
+if __name__ == "__main__":
+    affected = routine_fetch()
+    print(f"\n=== routine_fetch done: {affected} new rows ===")

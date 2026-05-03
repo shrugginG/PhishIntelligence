@@ -1,0 +1,32 @@
+name: Fetch PhishTank (hourly)
+
+# Routine incremental fetch from PhishTank bulk JSON dump.
+# Anchor strategy: SELECT MAX(phish_id) FROM raw_phishtank — no separate state table.
+# Application-layer filter (NOT short-circuit) because dump is not strictly
+# monotonic by phish_id (~1.4% local reversals would silently drop new entries).
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # 每小时第 17 分钟，避开整点 GitHub Actions 排队拥堵
+  workflow_dispatch: {}    # 也允许手动触发用于调试
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run PhishTank routine fetch
+        run: uv run python -m src.sources.phishtank
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PHISHTANK_TOKEN: ${{ secrets.PHISHTANK_TOKEN }}
