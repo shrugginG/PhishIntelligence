@@ -104,23 +104,16 @@ def _b64url(url: str) -> str:
 
 
 def _extract_vt_id(analysis_id: str) -> str | None:
-    """analysis_id format 'u-<sha256_64hex>-<hex_unix_ts>' — extract the sha256."""
+    """analysis_id format 'u-<sha256_64hex>-<opaque_suffix>' — extract the sha256.
+
+    The trailing suffix is NOT a unix timestamp (empirically: hex decodes to
+    1992 for analyses created in 2026). Treat it as opaque; for "submitted age"
+    use vt_url_reports.last_fetched_at instead.
+    """
     parts = analysis_id.split("-")
     if len(parts) >= 3 and len(parts[1]) == 64:
         return parts[1]
     return None
-
-
-def _analysis_age_sec(analysis_id: str) -> int | None:
-    """Seconds since analysis was queued, or None if unparseable."""
-    parts = analysis_id.rsplit("-", 1)
-    if len(parts) != 2:
-        return None
-    try:
-        ts = int(parts[1], 16)
-    except ValueError:
-        return None
-    return int(time.time()) - ts
 
 
 # ───── async HTTP layer ─────
@@ -199,11 +192,13 @@ async def _do_post(client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict)
 
 async def _do_poll(client: httpx.AsyncClient, sem: asyncio.Semaphore, row: dict) -> dict:
     async with sem:
-        # Pre-check timeout from analysis_id timestamp
-        age = _analysis_age_sec(row["analysis_id"])
-        if age is not None and age > SUBMITTED_TIMEOUT_SEC:
-            return {"row": row, "phase": "poll", "ok": False, "timeout": True,
-                    "error": f"analysis age {age}s > {SUBMITTED_TIMEOUT_SEC}s — clearing analysis_id for re-POST"}
+        # Pre-check timeout using row.last_fetched_at (set by POST, NOT bumped by still-queued polls)
+        lf = row.get("last_fetched_at")
+        if lf is not None:
+            age = (datetime.now(timezone.utc) - lf).total_seconds()
+            if age > SUBMITTED_TIMEOUT_SEC:
+                return {"row": row, "phase": "poll", "ok": False, "timeout": True,
+                        "error": f"submitted age {int(age)}s > {SUBMITTED_TIMEOUT_SEC}s — clearing analysis_id for re-POST"}
 
         ana = await _vt_get_analysis(client, row["analysis_id"])
         if not ana.get("ok"):
@@ -247,7 +242,7 @@ def _select_pending_batch(conn, limit: int) -> list[dict]:
 
 def _select_submitted_batch(conn, limit: int) -> list[dict]:
     sql = """
-        SELECT v.url_sha256, v.vt_id, v.analysis_id, v.fetch_attempts
+        SELECT v.url_sha256, v.vt_id, v.analysis_id, v.fetch_attempts, v.last_fetched_at
         FROM vt_url_reports v
         WHERE v.fetch_status IN ('submitted', 'failed')
           AND v.analysis_id IS NOT NULL
@@ -329,17 +324,10 @@ def _apply_poll_result(conn, result: dict, counts: dict) -> None:
         conn.commit()
         return
 
-    # Still queued/in-progress — just bump last_fetched_at, no attempt change
+    # Still queued/in-progress — leave last_fetched_at untouched on purpose,
+    # so the SUBMITTED_TIMEOUT_SEC clock still measures from POST time, not last poll.
     if not result.get("completed"):
-        sql = """
-            UPDATE vt_url_reports
-            SET last_fetched_at = now()
-            WHERE url_sha256 = %s
-        """
-        with conn.cursor() as cur:
-            cur.execute(sql, (sha,))
         counts["polled_pending"] += 1
-        conn.commit()
         return
 
     # Completed with full report → done
