@@ -1,0 +1,34 @@
+name: Fetch PhishStats (every 2h)
+
+# Routine incremental fetch from PhishStats /api/phishing.
+# Source updates every 90 min (per official docs, "no more frequently than
+# this interval to ensure optimal performance"). We use 2h cron — slightly
+# wider than source cadence to stay well within their guidance.
+# Anchor: SELECT MAX(id) FROM raw_phishstats.
+# Short-circuit IS safe: API _sort=-id is strict desc.
+# INSERT-only (no UPSERT) — same rationale as eCrimeX.
+
+on:
+  schedule:
+    - cron: '48 */2 * * *'   # 每 2 小时第 48 分钟，错开其它源
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run PhishStats routine fetch
+        run: uv run python -m src.sources.phishstats
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}

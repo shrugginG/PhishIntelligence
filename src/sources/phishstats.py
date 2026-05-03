@@ -156,5 +156,59 @@ def bootstrap_fetch(size: int | None) -> int:
     records = _fetch(size)
     print(f"  Fetched {len(records)} records")
     affected = _upsert(records)
-    print(f"  Upsert affected {affected} rows")
+    print(f"  Insert affected {affected} rows")
     return affected
+
+
+def _get_anchor() -> int:
+    """Returns MAX(id) from raw_phishstats, or 0 if empty."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(MAX(id), 0) FROM raw_phishstats")
+        return cur.fetchone()[0]
+
+
+def _fetch_since(anchor: int) -> list[dict]:
+    """Paginate API by id desc, short-circuit when a page contains any
+    record with id <= anchor (PhishStats `_sort=-id` is strict desc).
+    """
+    records: list[dict] = []
+    last_page = 0
+    with httpx.Client(timeout=60) as client:
+        for page in range(1, MAX_PAGES_SAFETY + 1):
+            last_page = page
+            resp = client.get(
+                API_URL,
+                params={"_p": page, "_size": PAGE_SIZE, "_sort": "-id"},
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+
+            new_in_batch = [r for r in batch if r["id"] > anchor]
+            records.extend(new_in_batch)
+            print(f"  page {page}: {len(batch)} fetched, {len(new_in_batch)} > anchor")
+
+            # Short-circuit: any record <= anchor means subsequent pages are even older
+            if len(new_in_batch) < len(batch):
+                break
+
+            time.sleep(INTER_PAGE_DELAY)
+
+    print(f"  Total over {last_page} page(s): {len(records)}")
+    return records
+
+
+def routine_fetch() -> int:
+    """Incremental fetch: paginate API for id > anchor."""
+    anchor = _get_anchor()
+    print(f"  Anchor: id > {anchor}")
+    records = _fetch_since(anchor)
+    affected = _upsert(records)
+    print(f"  Insert affected {affected} rows")
+    return affected
+
+
+if __name__ == "__main__":
+    affected = routine_fetch()
+    print(f"\n=== routine_fetch done: {affected} rows ===")
