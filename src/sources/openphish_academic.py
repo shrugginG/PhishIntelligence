@@ -10,6 +10,7 @@ Env: OPENPHISH_GITHUB_USER, OPENPHISH_GITHUB_PAT
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from datetime import datetime
 
 from src.shared.db import get_connection
 
@@ -127,3 +129,83 @@ def bootstrap_fetch(size: int | None) -> int:
         return affected
     finally:
         shutil.rmtree(repo_path, ignore_errors=True)
+
+
+def _read_feed_csv(repo_path: str) -> list[dict]:
+    """Read feed.csv (24h rolling, CSV format), normalize empty strings to None,
+    parse `is_spear` to bool. CSV cannot distinguish null from empty string;
+    we collapse both to None for consistency with JSON archive parsing.
+    """
+    csv_path = os.path.join(repo_path, "feed.csv")
+
+    def _norm(v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s if s else None
+
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        records = []
+        for row in reader:
+            normalized = {k: _norm(v) for k, v in row.items()}
+            normalized["is_spear"] = (row.get("is_spear", "").strip().lower() == "true")
+            records.append(normalized)
+    return records
+
+
+def _get_anchor() -> datetime | None:
+    """Returns MAX(discover_time) from raw_openphish_academic, None if empty."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT MAX(discover_time) FROM raw_openphish_academic")
+        return cur.fetchone()[0]
+
+
+def _parse_isotime(s: str | None) -> datetime | None:
+    """Parse '2026-04-30T23:59:53Z' to tz-aware datetime.
+    Python 3.11+ accepts 'Z' suffix in fromisoformat directly.
+    """
+    if not s:
+        return None
+    return datetime.fromisoformat(s)
+
+
+def routine_fetch() -> int:
+    """Incremental fetch: clone repo, read feed.csv (24h, strictly desc by isotime),
+    break early on isotime <= anchor.
+
+    Short-circuit IS safe here (verified empirically: feed.csv 100% strict desc).
+    Contrast with PhishTank where ~1.4% local reversals make break unsafe.
+    """
+    anchor = _get_anchor()
+    if anchor:
+        print(f"  Anchor: discover_time > {anchor.isoformat()}")
+    else:
+        print("  Anchor: empty table, all rows considered new")
+
+    repo_path = _clone_repo()
+    try:
+        records = _read_feed_csv(repo_path)
+        print(f"  feed.csv has {len(records)} rows")
+
+        new: list[dict] = []
+        for r in records:
+            iso_dt = _parse_isotime(r.get("isotime"))
+            if iso_dt is None:
+                continue   # malformed row — skip but don't break
+            if anchor is None or iso_dt > anchor:
+                new.append(r)
+            else:
+                break      # strict desc: subsequent rows are all older
+
+        print(f"  New entries beyond anchor: {len(new)} (out of {len(records)} feed rows)")
+        affected = _upsert(new)
+        print(f"  Upsert affected {affected} rows")
+        return affected
+    finally:
+        shutil.rmtree(repo_path, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    affected = routine_fetch()
+    print(f"\n=== routine_fetch done: {affected} rows ===")
