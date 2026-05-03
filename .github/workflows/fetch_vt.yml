@@ -1,0 +1,37 @@
+name: Fetch VirusTotal URL reports (hourly)
+
+# Routine async pipeline that processes vt_url_reports rows in two phases:
+#   Phase 1 — poll submitted analyses; on completion fetch full URL report → 'done'
+#   Phase 2 — POST pending URLs for scanning → 'submitted' (vt_id + analysis_id saved)
+#
+# Concurrency: asyncio.Semaphore(10) over httpx.AsyncClient → ~20 req/s sustained.
+# Quota self-throttle: aborts early if user_daily usage > 95%.
+# Failed rows retry per smart routing on (fetch_status, analysis_id); cap 3 attempts.
+
+on:
+  schedule:
+    - cron: '0 * * * *'      # 每小时整点 — 错峰前比对其他 fetcher 时刻无冲突
+                              # 现有: :08/:23/:38/:53 (oa), :17 (pt), :27 (oc), :32 (ec), :48 (ps)
+  workflow_dispatch: {}      # 手动触发用于调试
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10      # 上限严格：300 calls × 50ms (sem=10) ≈ 15s + DB ≪ 10 min
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run VT routine fetch
+        run: uv run python -m src.sources.vt
+        env:
+          SUPABASE_DB_URL:              ${{ secrets.SUPABASE_DB_URL }}
+          VIRUSTOTAL_ACADEMIC_API_KEY:  ${{ secrets.VIRUSTOTAL_ACADEMIC_API_KEY }}
