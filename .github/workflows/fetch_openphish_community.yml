@@ -1,0 +1,31 @@
+name: Fetch OpenPhish Community (every 6h)
+
+# Routine fetch from OpenPhish public community feed.
+# Source cadence verified: openphish/public_feed commits exactly every 12h
+# (00:00 / 12:00 UTC). We pull every 6h for 2× safety margin → max lag 6h.
+# No anchor logic: source has no IDs/timestamps, just 300 URL list (~15 KB).
+
+on:
+  schedule:
+    - cron: '27 */6 * * *'   # 00:27, 06:27, 12:27, 18:27 — 错峰避开其它源 cron
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run OpenPhish Community routine fetch
+        run: uv run python -m src.sources.openphish_community
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}

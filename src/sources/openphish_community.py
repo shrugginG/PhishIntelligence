@@ -52,3 +52,21 @@ def bootstrap_fetch(size: int | None) -> int:
     affected = _upsert(selected)
     print(f"  Upsert affected {affected} rows")
     return affected
+
+
+def routine_fetch() -> int:
+    """Pull all 300 URLs from feed.txt, dedupe via ON CONFLICT (url_sha256).
+
+    No anchor logic: source size is tiny (300 rows / ~15 KB) and has no
+    timestamps/IDs. Full-pull + ON CONFLICT DO NOTHING is simpler than any
+    anchor strategy and the cost (a few KB + ~50 ms PG work) is negligible.
+    """
+    urls = _fetch_feed()
+    affected = _upsert(urls)
+    print(f"  Upsert affected {affected} rows (out of {len(urls)} feed rows)")
+    return affected
+
+
+if __name__ == "__main__":
+    affected = routine_fetch()
+    print(f"\n=== routine_fetch done: {affected} rows ===")
