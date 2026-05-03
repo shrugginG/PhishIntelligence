@@ -1,0 +1,34 @@
+name: Fetch eCrimeX (hourly)
+
+# Routine incremental fetch from eCrimeX /api/v1/phish.
+# Source is "real-time" (continuously growing phish_id). Hourly cron is
+# adequate — typical phish ingestion rate at eCrimeX's scale.
+# Anchor: SELECT MAX(phish_id) FROM raw_ecrimex.
+# Short-circuit IS safe: API returns by id desc.
+# INSERT-only (no UPSERT) — see ecrimex.py module docstring for rationale.
+
+on:
+  schedule:
+    - cron: '32 * * * *'   # 每小时第 32 分钟，错开其它源的 cron 时刻
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run eCrimeX routine fetch
+        run: uv run python -m src.sources.ecrimex
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ECRIMEX_TOKEN:   ${{ secrets.ECRIMEX_TOKEN }}

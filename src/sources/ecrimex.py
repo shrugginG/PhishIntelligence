@@ -3,9 +3,12 @@
 Source: REST API at `https://ecrimex.net/api/v1/phish?page=N&limit=N` with
 `Authorization: Bearer <token>`. Default sort is id desc (newest first).
 
-Bootstrap pulls latest N via paginated calls (up to 100 per page).
-On UPSERT we only overwrite when source-side `updatedAt` is newer
-(captures active→inactive status flips).
+Design choice: raw_ecrimex stores a **first-observation snapshot only**. We do
+NOT track source-side updates (is_active flips, submission_count growth, etc.).
+Aliveness is determined by Web Agent at crawl time; raw_payload still preserves
+the source's status/submissionCount at ingestion for forensic analysis.
+
+This means INSERT path is the only path. ON CONFLICT DO NOTHING.
 
 Env: ECRIMEX_TOKEN
 """
@@ -63,7 +66,7 @@ def _upsert(records: list[dict]) -> int:
     rows = []
     for r in records:
         url = r["url"]
-        # discoveredAt is string-epoch in actual responses; createdAt/updatedAt are int
+        # discoveredAt is string-epoch in actual responses; createdAt is int
         disc = int(r["discoveredAt"]) if isinstance(r["discoveredAt"], str) else r["discoveredAt"]
         rows.append(
             (
@@ -72,14 +75,11 @@ def _upsert(records: list[dict]) -> int:
                 hashlib.sha256(url.encode()).hexdigest(),
                 r["brand"],
                 r["confidence"],
-                r["status"] == "active",
                 r.get("ip", []),
                 r.get("asn", []),
                 r.get("tld"),
-                r.get("metadata", {}).get("submissionCount"),
                 disc,
                 r["createdAt"],
-                r["updatedAt"],
                 json.dumps(r, ensure_ascii=False),
             )
         )
@@ -87,21 +87,16 @@ def _upsert(records: list[dict]) -> int:
     sql = """
         INSERT INTO raw_ecrimex
             (phish_id, url, url_sha256,
-             brand, confidence, is_active,
-             ip, asn, tld, submission_count,
-             discovered_at, created_at, updated_at,
+             brand, confidence,
+             ip, asn, tld,
+             discovered_at, created_at,
              raw_payload)
         VALUES (%s, %s, %s,
-                %s, %s, %s,
-                %s::inet[], %s::integer[], %s, %s,
-                to_timestamp(%s::numeric), to_timestamp(%s::numeric), to_timestamp(%s::numeric),
+                %s, %s,
+                %s::inet[], %s::integer[], %s,
+                to_timestamp(%s::numeric), to_timestamp(%s::numeric),
                 %s::jsonb)
-        ON CONFLICT (phish_id) DO UPDATE SET
-            is_active        = EXCLUDED.is_active,
-            updated_at       = EXCLUDED.updated_at,
-            submission_count = EXCLUDED.submission_count,
-            raw_payload      = EXCLUDED.raw_payload
-        WHERE raw_ecrimex.updated_at < EXCLUDED.updated_at
+        ON CONFLICT (phish_id) DO NOTHING
     """
 
     with get_connection() as conn, conn.cursor() as cur:
@@ -113,5 +108,59 @@ def bootstrap_fetch(size: int | None) -> int:
     records = _fetch(size)
     print(f"  Fetched {len(records)} records")
     affected = _upsert(records)
-    print(f"  Upsert affected {affected} rows")
+    print(f"  Insert affected {affected} rows")
     return affected
+
+
+def _get_anchor() -> int:
+    """Returns MAX(phish_id) from raw_ecrimex, or 0 if empty."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(MAX(phish_id), 0) FROM raw_ecrimex")
+        return cur.fetchone()[0]
+
+
+def routine_fetch() -> int:
+    """Incremental fetch: paginate eCrimeX API for phish_id > anchor.
+
+    eCrimeX returns by id desc. Short-circuit IS safe: once a page contains any
+    record with id <= anchor, all subsequent pages are entirely older records.
+    """
+    anchor = _get_anchor()
+    print(f"  Anchor: phish_id > {anchor}")
+
+    token = os.environ["ECRIMEX_TOKEN"]
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+    new_records: list[dict] = []
+    last_page = 0
+    with httpx.Client(timeout=60) as client:
+        for page in range(1, MAX_PAGES_SAFETY + 1):
+            last_page = page
+            resp = client.get(
+                API_URL,
+                headers=headers,
+                params={"page": page, "limit": PAGE_LIMIT},
+            )
+            resp.raise_for_status()
+            batch = resp.json().get("data", [])
+            if not batch:
+                break
+
+            new_in_batch = [r for r in batch if r["id"] > anchor]
+            new_records.extend(new_in_batch)
+            print(f"  page {page}: {len(batch)} fetched, {len(new_in_batch)} > anchor")
+
+            # Short-circuit: if this page had any rows ≤ anchor, all subsequent pages
+            # contain only even older records (eCrimeX is strict id desc).
+            if len(new_in_batch) < len(batch):
+                break
+
+    print(f"  Total new records over {last_page} page(s): {len(new_records)}")
+    affected = _upsert(new_records)
+    print(f"  Insert affected {affected} rows")
+    return affected
+
+
+if __name__ == "__main__":
+    affected = routine_fetch()
+    print(f"\n=== routine_fetch done: {affected} rows ===")
