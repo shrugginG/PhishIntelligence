@@ -54,9 +54,27 @@ def _fetch(size: int | None) -> list[dict]:
     return records
 
 
+def _scrub_null_bytes(obj):
+    """Recursively replace \\x00 (null byte) in any string. PG rejects null
+    bytes in TEXT and JSONB (JSONB explicitly disallows \\u0000 escape).
+    PhishStats' page_text field can contain raw binary from scraped pages.
+    """
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {k: _scrub_null_bytes(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_null_bytes(v) for v in obj]
+    return obj
+
+
 def _upsert(records: list[dict]) -> int:
     if not records:
         return 0
+
+    # Defensive: PhishStats records may contain null bytes (esp. in page_text);
+    # PG JSONB and TEXT can't represent them.
+    records = [_scrub_null_bytes(r) for r in records]
 
     rows = []
     for r in records:
