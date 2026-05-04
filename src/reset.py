@@ -23,6 +23,7 @@ TABLES = [
     "raw_phishstats",
     "phishing_urls",
     "vt_url_reports",
+    "urlscan_url_scans",
 ]
 
 

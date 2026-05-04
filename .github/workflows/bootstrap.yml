@@ -2,16 +2,16 @@ name: Bootstrap (manual)
 
 # Manually triggered only — pulls latest N items from each chosen target,
 # upserts to raw_* tables (which auto-derive phishing_urls via triggers,
-# which in turn auto-derive vt_url_reports via another trigger),
-# then optionally marks all newly-ingested phishing_urls / vt_url_reports
-# rows as 'stale' (default on).
+# which in turn auto-derive vt_url_reports + urlscan_url_scans via more triggers),
+# then optionally marks all newly-ingested phishing_urls / vt_url_reports /
+# urlscan_url_scans rows as 'stale' (default on).
 #
 # Targets fall in two flavors:
 #   - Source targets (raw fetchers, hit external HTTP): phishtank,
 #     openphish_academic, openphish_community, ecrimex, phishstats —
 #     bounded by per-source sizes below
-#   - Derived-table targets (internal SQL only): vt — registers every
-#     existing phishing_urls row in vt_url_reports
+#   - Derived-table targets (internal SQL only): vt, urlscan — register every
+#     existing phishing_urls row in vt_url_reports / urlscan_url_scans
 #
 # Sizes default to 100 per source; pass "all" to fetch the full source-end
 # window (varies per source — see README / CLAUDE.md). Sizes do not apply
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Comma-separated targets, or "all". Valid: phishtank, openphish_academic, openphish_community, ecrimex, phishstats, vt, all'
+        description: 'Comma-separated targets, or "all". Valid: phishtank, openphish_academic, openphish_community, ecrimex, phishstats, vt, urlscan, all'
         default: 'all'
         required: true
       phishtank_size:
@@ -40,7 +40,7 @@ on:
         description: 'PhishStats: N or "all" (rate-limited 20 req/min)'
         default: '100'
       mark_stale:
-        description: 'Mark bootstrap data as stale in both phishing_urls and vt_url_reports (recommended)'
+        description: 'Mark bootstrap data as stale across phishing_urls / vt_url_reports / urlscan_url_scans (recommended)'
         type: boolean
         default: true
 

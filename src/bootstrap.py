@@ -5,16 +5,17 @@ Locally: `uv run python -m src.bootstrap --targets all --phishtank-size 10 ...`
 
 Targets fall in two flavors:
   - Source targets (raw_* fetchers): hit external HTTP, bounded by --<src>-size
-  - Derived-table targets (vt): internal SQL only, no size
+  - Derived-table targets (vt, urlscan): internal SQL only, no size
 
 For each target:
-  - call <target>.bootstrap_fetch(size=...) — vt accepts but ignores size
+  - call <target>.bootstrap_fetch(size=...) — vt/urlscan accept but ignore size
   - on exception: log + mark target as failed; other targets keep running
 
-After all targets run, optionally UPDATE phishing_urls SET crawl_status='stale'
-AND vt_url_reports SET fetch_status='stale' for rows ingested during this
-bootstrap window — keeps both tables aligned and prevents Web Agent / VT
-fetcher from acting on possibly-already-dead historical phishes.
+After all targets run, optionally UPDATE phishing_urls SET crawl_status='stale',
+vt_url_reports SET fetch_status='stale', urlscan_url_scans SET fetch_status='stale'
+for rows ingested during this bootstrap window — keeps all three tables aligned
+and prevents Web Agent / VT fetcher / urlscan fetcher from acting on
+possibly-already-dead historical phishes.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ SOURCE_TARGETS: list[str] = [
     "phishstats",
 ]
 
-ALL_TARGETS: list[str] = SOURCE_TARGETS + ["vt"]
+ALL_TARGETS: list[str] = SOURCE_TARGETS + ["vt", "urlscan"]
 
 
 def _parse_size(s: str) -> int | None:
@@ -68,16 +69,17 @@ def _run_one(target: str, size: int | None) -> tuple[str, int | str]:
         return ("failed", str(e))
 
 
-def _mark_stale_since(start_ts: datetime) -> tuple[int, int]:
-    """Mark rows ingested at/after start_ts as stale, in both tables.
+def _mark_stale_since(start_ts: datetime) -> tuple[int, int, int]:
+    """Mark rows ingested at/after start_ts as stale, across three tables.
 
-    phishing_urls: crawl_status pending → stale
-    vt_url_reports: fetch_status pending → stale
+    phishing_urls:     crawl_status pending → stale
+    vt_url_reports:    fetch_status pending → stale
+    urlscan_url_scans: fetch_status pending → stale
 
     Only touches rows still in 'pending' state, never overrides a status
     something else already changed.
 
-    Returns (n_phishing_urls, n_vt_url_reports).
+    Returns (n_phishing_urls, n_vt_url_reports, n_urlscan_url_scans).
     """
     sql_phish = """
         UPDATE phishing_urls
@@ -89,12 +91,19 @@ def _mark_stale_since(start_ts: datetime) -> tuple[int, int]:
         SET fetch_status = 'stale'
         WHERE ingested_at >= %s AND fetch_status = 'pending'
     """
+    sql_urlscan = """
+        UPDATE urlscan_url_scans
+        SET fetch_status = 'stale'
+        WHERE ingested_at >= %s AND fetch_status = 'pending'
+    """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(sql_phish, (start_ts,))
         n_phish = cur.rowcount
         cur.execute(sql_vt, (start_ts,))
         n_vt = cur.rowcount
-        return (n_phish, n_vt)
+        cur.execute(sql_urlscan, (start_ts,))
+        n_urlscan = cur.rowcount
+        return (n_phish, n_vt, n_urlscan)
 
 
 def main() -> None:
@@ -128,8 +137,9 @@ def main() -> None:
         print(f"    → {status}: {info}\n")
 
     if args.mark_stale:
-        n_phish, n_vt = _mark_stale_since(bootstrap_start)
-        print(f"--- Marked stale: phishing_urls={n_phish}, vt_url_reports={n_vt} ---\n")
+        n_phish, n_vt, n_urlscan = _mark_stale_since(bootstrap_start)
+        print(f"--- Marked stale: phishing_urls={n_phish}, vt_url_reports={n_vt}, "
+              f"urlscan_url_scans={n_urlscan} ---\n")
     else:
         print("--- mark_stale disabled, skipping ---\n")
 
