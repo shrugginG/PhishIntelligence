@@ -23,13 +23,18 @@ for both throughput and resilience (one key 429s, the next picks up).
 NAS layout (DATA_ROOT defaults to /data inside container, bind-mounted from
 ~/data/phishing/urlscan_results on host):
 
-    {DATA_ROOT}/{yyyy-mm}/{dd}/{uuid}/
+    {DATA_ROOT}/{url_sha256}/{uuid}/
       ├── result.json.gz       gzip of GET /api/v1/result/{uuid}/
       ├── screenshot.png       raw bytes of /screenshots/{uuid}.png
       ├── dom.html.gz          gzip of /dom/{uuid}/
       └── meta.json            self-describing audit record (written LAST as
                                the completion marker — its presence means the
                                scan landed atomically)
+
+Layout rationale: url_sha256 as the primary partition co-locates every scan
+of the same URL (default scan + future language_followup + manual rescans)
+under one parent directory, making "what data do we have for URL X" a one-
+liner. uuid is unique per scan and remains the inner directory.
 
 Concurrency via asyncio.Semaphore(CONCURRENCY); each request picks the next
 key from the pool. HARD_BUDGET_SEC enforces a hard tick deadline so the
@@ -193,20 +198,13 @@ async def _get_bytes(client: httpx.AsyncClient, api_key: str, path: str) -> byte
 
 # ═══════════════════════════ NAS storage layer ═══════════════════════════
 
-def _path_for_uuid(uuid: str) -> Path:
-    """Derive {DATA_ROOT}/{yyyy-mm}/{dd}/{uuid}/ from UUIDv7 timestamp prefix.
+def _scan_dir(url_sha256: str, uuid: str) -> Path:
+    """Derive the per-scan directory: {DATA_ROOT}/{url_sha256}/{uuid}/.
 
-    UUIDv7 first 12 hex digits = 48-bit Unix epoch ms. urlscan task UUIDs are
-    UUIDv7 (verified: 019df104-… → 2026-05-04). Fallback to 'unknown'
-    partition for any malformed input.
+    url_sha256 as the outer partition co-locates all scans of the same URL.
+    uuid is the inner per-scan directory (unique by urlscan's own ID).
     """
-    try:
-        ms = int(uuid.replace("-", "")[:12], 16)
-        ts = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-        partition = ts.strftime("%Y-%m/%d")
-    except Exception:
-        partition = "unknown"
-    return DATA_ROOT / partition / uuid
+    return DATA_ROOT / url_sha256 / uuid
 
 
 def _write_to_nas(
@@ -225,7 +223,7 @@ def _write_to_nas(
     """Write the 4-pack to NAS. meta.json is written LAST as the completion marker:
     its presence means everything else for this uuid is on disk.
     """
-    target = _path_for_uuid(uuid)
+    target = _scan_dir(url_sha256, uuid)
     target.mkdir(parents=True, exist_ok=True)
 
     # 1. result.json.gz
