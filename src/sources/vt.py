@@ -40,15 +40,17 @@ from src.shared.db import get_connection
 API_BASE                = "https://www.virustotal.com/api/v3"
 CONCURRENCY             = 10
 # PHASE_1_LIMIT must be > expected POST rate per cron, otherwise submitted
-# backlog grows unbounded and rows time out before being polled. With 1h cron +
-# ~200 POST/run steady state, 1000 is comfortable headroom for catch-up too.
+# backlog grows unbounded and rows time out before being polled.
 PHASE_1_LIMIT           = 1000       # poll batch
-PHASE_2_LIMIT           = 200        # POST batch
+# GH Actions free-tier cron is best-effort: observed ~13/48 fires per day, so
+# effective cadence is ~110 min not 30 min. Bumped 200→400 to absorb the missed
+# fires; daily ceiling 400×48=19.2k still under VT academic quota (20k/day).
+PHASE_2_LIMIT           = 400        # POST batch
 MAX_ATTEMPTS            = 3
-# Must exceed cron interval so a row missed by the next poll cycle doesn't
-# falsely time out. With 1h cron + ~90s typical analysis turnaround, 2h gives
-# room for "first poll missed → second poll catches it" without false-positives.
-SUBMITTED_TIMEOUT_SEC   = 2 * 60 * 60
+# Must exceed observed cron gap so rows submitted in run N aren't falsely timed
+# out before run N+1 polls them. With ~110 min real-world cron interval, 4h
+# gives 2× safety margin against GH Actions cron drift.
+SUBMITTED_TIMEOUT_SEC   = 4 * 60 * 60
 QUOTA_ABORT_RATIO       = 0.95
 HTTP_TIMEOUT_SEC        = 20.0
 HTTP_CONNECT_TIMEOUT    = 10.0
