@@ -42,10 +42,14 @@ CONCURRENCY             = 10
 # PHASE_1_LIMIT must be > expected POST rate per cron, otherwise submitted
 # backlog grows unbounded and rows time out before being polled.
 PHASE_1_LIMIT           = 1000       # poll batch
-# GH Actions free-tier cron is best-effort: observed ~13/48 fires per day, so
-# effective cadence is ~110 min not 30 min. Bumped 200→400 to absorb the missed
-# fires; daily ceiling 400×48=19.2k still under VT academic quota (20k/day).
-PHASE_2_LIMIT           = 400        # POST batch
+# GH Actions free-tier cron is best-effort: observed ~14/day fires (median gap
+# ~90 min), single gaps up to 226 min. At 400 the system can only process
+# ~3k/day vs 4k/day inflow → backlog grows ~1k/day. Bumped to 800 so each run
+# can both clear submitted and absorb the larger batch of accumulated pending
+# from a long cron gap. Steady-state cost stays at inflow×3 ≈ 12k/day calls,
+# safely under VT academic quota (20k/day); QUOTA_ABORT_RATIO=0.95 is the
+# final hard stop.
+PHASE_2_LIMIT           = 800        # POST batch
 MAX_ATTEMPTS            = 3
 # Must exceed observed cron gap so rows submitted in run N aren't falsely timed
 # out before run N+1 polls them. With ~110 min real-world cron interval, 4h
