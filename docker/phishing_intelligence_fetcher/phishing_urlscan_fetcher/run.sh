@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # DSM Task Scheduler invokes this script every 15 min.
 #
-# `docker run --name phish-urlscan-fetcher` acts as a concurrency lock: if the
-# previous tick is still in flight, the new docker run fails immediately
+# `docker run --name phishing_urlscan_fetcher` acts as a concurrency lock: if
+# the previous tick is still in flight, the new docker run fails immediately
 # ("name in use") and DSM logs the skip — naturally preventing tick overlap.
+#
+# As of Phase 3 of the GH→NAS migration, scan output goes to Supabase Storage
+# (bucket `phishing-urlscan-results`) via HTTP PUT, NOT to a host bind mount.
+# The bind mount of ~/data/phishing/urlscan_results was removed accordingly;
+# the historical files at that path remain untouched as a pre-migration archive.
 #
 # Robust to being invoked by:
 #   - DSM Task Scheduler (typically as root; $HOME = /root)
@@ -13,8 +18,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOST_DATA_DIR="/var/services/homes/jxlu/data/phishing/urlscan_results"
 DOCKER_BIN="/usr/local/bin/docker"
+IMAGE="phishing_urlscan_fetcher:latest"
 # OS-level hard kill: container's in-process HARD_BUDGET_SEC only stops
 # scheduling new work; if asyncio loop deadlocks (observed once: futex_wait
 # for 6h+, holding the --name lock and blocking every subsequent DSM tick)
@@ -25,8 +30,7 @@ HARD_KILL_SEC=900
 cd "$SCRIPT_DIR"
 
 exec timeout --kill-after=30 "$HARD_KILL_SEC" "$DOCKER_BIN" run --rm \
-  --name phish-urlscan-fetcher \
+  --name phishing_urlscan_fetcher \
   --user 1026:100 \
   --env-file "$SCRIPT_DIR/.env" \
-  -v "${HOST_DATA_DIR}:/data" \
-  phish-urlscan-fetcher:latest
+  "$IMAGE"

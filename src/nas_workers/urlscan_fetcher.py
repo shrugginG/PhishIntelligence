@@ -5,7 +5,7 @@ exits after a single tick. Two-phase per-tick state machine:
 
   Phase 1 (poll first to drain previous-tick stragglers):
     SELECT submitted/failed-with-uuid → GET /api/v1/result/{uuid}/
-       200          → fetch screenshot+dom → write NAS 4-pack → UPDATE done
+       200          → fetch screenshot+dom → upload 4-pack to Storage → UPDATE done
        404          → still queued, no DB change
        timeout-aged → clear uuid + UPDATE pending (next tick re-POSTs)
        4xx/5xx      → UPDATE failed, attempts++
@@ -20,21 +20,27 @@ API key pool: URLSCAN_API_KEYS env var holds one or more comma-separated keys.
 Round-robin across keys multiplies effective daily quota by pool size; helpful
 for both throughput and resilience (one key 429s, the next picks up).
 
-NAS layout (DATA_ROOT defaults to /data inside container, bind-mounted from
-~/data/phishing/urlscan_results on host):
+Storage layout (Supabase Storage bucket `phishing-urlscan-results`, private,
+service-role-key for write):
 
-    {DATA_ROOT}/{url_sha256}/{uuid}/
-      ├── result.json.gz       gzip of GET /api/v1/result/{uuid}/
-      ├── screenshot.png       raw bytes of /screenshots/{uuid}.png
-      ├── dom.html.gz          gzip of /dom/{uuid}/
-      └── meta.json            self-describing audit record (written LAST as
-                               the completion marker — its presence means the
-                               scan landed atomically)
+    {bucket}/{url_sha256}/{uuid}/
+      ├── result.json.gz       gzip of GET /api/v1/result/{uuid}/    application/gzip
+      ├── screenshot.png       raw bytes of /screenshots/{uuid}.png  image/png
+      ├── dom.html.gz          gzip of /dom/{uuid}/                  application/gzip
+      └── meta.json            self-describing audit record          application/json
+                               (uploaded LAST as the completion marker — its
+                               presence in Storage means the 4-pack landed)
+
+Writes go through the Storage REST API (POST + x-upsert: true) at
+${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/<path>. Idempotent on
+retry: a tick that crashes mid-upload leaves the row 'submitted', the next
+tick re-polls + re-uploads; existing files are replaced rather than rejected.
 
 Layout rationale: url_sha256 as the primary partition co-locates every scan
 of the same URL (default scan + future language_followup + manual rescans)
 under one parent directory, making "what data do we have for URL X" a one-
-liner. uuid is unique per scan and remains the inner directory.
+liner — Studio Storage GUI can drill in by `url_sha256/`. uuid is the inner
+per-scan directory (unique by urlscan's own ID).
 
 Concurrency via asyncio.Semaphore(CONCURRENCY); each request picks the next
 key from the pool. HARD_BUDGET_SEC enforces a hard tick deadline so the
@@ -50,7 +56,6 @@ import os
 import time
 from datetime import datetime, timezone
 from itertools import cycle
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -61,7 +66,6 @@ from src.shared.db import get_connection
 # ═══════════════════════════ tunables (env-driven) ═══════════════════════════
 
 API_BASE              = "https://urlscan.io"
-DATA_ROOT             = Path(os.environ.get("URLSCAN_DATA_ROOT", "/data"))
 PHASE_1_LIMIT         = int(os.environ.get("PHASE_1_LIMIT", "200"))
 PHASE_2_LIMIT         = int(os.environ.get("PHASE_2_LIMIT", "100"))
 CONCURRENCY           = int(os.environ.get("CONCURRENCY", "5"))
@@ -74,6 +78,7 @@ MAX_ATTEMPTS          = int(os.environ.get("MAX_ATTEMPTS", "3"))
 QUOTA_ABORT_RATIO     = float(os.environ.get("QUOTA_ABORT_RATIO", "0.95"))
 HTTP_TIMEOUT_SEC      = float(os.environ.get("HTTP_TIMEOUT_SEC", "30"))
 HTTP_CONNECT_TIMEOUT  = float(os.environ.get("HTTP_CONNECT_TIMEOUT", "10"))
+STORAGE_BUCKET        = os.environ.get("STORAGE_BUCKET", "phishing-urlscan-results")
 
 
 # ═══════════════════════════ API key pool ═══════════════════════════
@@ -112,8 +117,39 @@ def _build_pool() -> UrlscanApiPool:
     return UrlscanApiPool(keys)
 
 
-def _headers(api_key: str) -> dict[str, str]:
+def _urlscan_headers(api_key: str) -> dict[str, str]:
     return {"API-Key": api_key, "User-Agent": "phish-intelligence-fetcher/0.1"}
+
+
+def _supabase_url() -> str:
+    v = os.environ.get("SUPABASE_URL")
+    if not v:
+        raise RuntimeError(
+            "SUPABASE_URL not set. Point at the Kong gateway: "
+            "self-host = http://192.168.1.161:8000, "
+            "cloud = https://<ref>.supabase.co"
+        )
+    return v.rstrip("/")
+
+
+def _supabase_service_key() -> str:
+    v = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not v:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY not set. Required for writes into the "
+            "private `phishing-urlscan-results` bucket."
+        )
+    return v
+
+
+def _storage_headers(content_type: str) -> dict[str, str]:
+    key = _supabase_service_key()
+    return {
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  content_type,
+        "x-upsert":      "true",   # idempotent: overwrite if path already exists
+    }
 
 
 # ═══════════════════════════ HTTP layer (async) ═══════════════════════════
@@ -124,7 +160,7 @@ async def _check_pool_quota(client: httpx.AsyncClient, pool: UrlscanApiPool) -> 
     total_limit = 0
     for k in pool.all_keys:
         try:
-            r = await client.get(f"{API_BASE}/user/quotas/", headers=_headers(k), timeout=10)
+            r = await client.get(f"{API_BASE}/user/quotas/", headers=_urlscan_headers(k), timeout=10)
             r.raise_for_status()
             day = r.json()["limits"]["public"]["day"]
             total_used  += day.get("used",  0)
@@ -148,7 +184,7 @@ async def _post_scan(
     try:
         r = await client.post(
             f"{API_BASE}/api/v1/scan/",
-            headers={**_headers(api_key), "Content-Type": "application/json"},
+            headers={**_urlscan_headers(api_key), "Content-Type": "application/json"},
             json=body,
         )
         if r.status_code == 200:
@@ -170,7 +206,7 @@ async def _get_result(
 ) -> dict[str, Any]:
     """GET /api/v1/result/{uuid}/. urlscan returns 404 while still queued (not 'missing')."""
     try:
-        r = await client.get(f"{API_BASE}/api/v1/result/{uuid}/", headers=_headers(api_key))
+        r = await client.get(f"{API_BASE}/api/v1/result/{uuid}/", headers=_urlscan_headers(api_key))
         if r.status_code == 200:
             return {"ok": True, "data": r.json()}
         if r.status_code == 404:
@@ -186,7 +222,7 @@ async def _get_result(
 async def _get_bytes(client: httpx.AsyncClient, api_key: str, path: str) -> bytes | None:
     """Fetch a binary asset (screenshot.png / dom.html). Returns None on 404 or error."""
     try:
-        r = await client.get(f"{API_BASE}{path}", headers=_headers(api_key))
+        r = await client.get(f"{API_BASE}{path}", headers=_urlscan_headers(api_key))
         if r.status_code == 200:
             return r.content
         if r.status_code == 404:
@@ -196,18 +232,31 @@ async def _get_bytes(client: httpx.AsyncClient, api_key: str, path: str) -> byte
         return None
 
 
-# ═══════════════════════════ NAS storage layer ═══════════════════════════
+# ═══════════════════════════ Storage layer (async) ═══════════════════════════
 
-def _scan_dir(url_sha256: str, uuid: str) -> Path:
-    """Derive the per-scan directory: {DATA_ROOT}/{url_sha256}/{uuid}/.
+async def _storage_put(
+    client: httpx.AsyncClient,
+    supabase_url: str,
+    object_path: str,
+    data: bytes,
+    content_type: str,
+) -> None:
+    """POST bytes to Supabase Storage with x-upsert=true (idempotent overwrite).
 
-    url_sha256 as the outer partition co-locates all scans of the same URL.
-    uuid is the inner per-scan directory (unique by urlscan's own ID).
+    Raises RuntimeError on non-2xx response. Caller can catch + mark the row
+    failed; the next tick will retry the entire poll → fetch → upload pipeline.
     """
-    return DATA_ROOT / url_sha256 / uuid
+    api = f"{supabase_url}/storage/v1/object/{STORAGE_BUCKET}/{object_path}"
+    r = await client.post(api, headers=_storage_headers(content_type), content=data)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Storage PUT {object_path} failed [{r.status_code}]: {r.text[:200]}"
+        )
 
 
-def _write_to_nas(
+async def _upload_to_storage(
+    client: httpx.AsyncClient,
+    supabase_url: str,
     *,
     uuid: str,
     url_sha256: str,
@@ -219,25 +268,33 @@ def _write_to_nas(
     result_json: dict,
     screenshot: bytes | None,
     dom: bytes | None,
-) -> Path:
-    """Write the 4-pack to NAS. meta.json is written LAST as the completion marker:
-    its presence means everything else for this uuid is on disk.
-    """
-    target = _scan_dir(url_sha256, uuid)
-    target.mkdir(parents=True, exist_ok=True)
+) -> str:
+    """Upload the 4-pack to Storage. Returns the path prefix on success.
 
-    # 1. result.json.gz
-    with gzip.open(target / "result.json.gz", "wb", compresslevel=6) as f:
-        f.write(json.dumps(result_json, ensure_ascii=False, separators=(",", ":")).encode())
+    meta.json is uploaded LAST as the completion marker: its presence in
+    Storage means everything else for this uuid landed successfully.
+    Raises on any individual upload failure.
+    """
+    prefix = f"{url_sha256}/{uuid}"
+
+    # 1. result.json.gz — gzip the JSON in memory, upload as application/gzip.
+    result_bytes = gzip.compress(
+        json.dumps(result_json, ensure_ascii=False, separators=(",", ":")).encode(),
+        compresslevel=6,
+    )
+    await _storage_put(client, supabase_url,
+                       f"{prefix}/result.json.gz", result_bytes, "application/gzip")
 
     # 2. screenshot.png (PNG already compressed; don't gzip)
     if screenshot is not None:
-        (target / "screenshot.png").write_bytes(screenshot)
+        await _storage_put(client, supabase_url,
+                           f"{prefix}/screenshot.png", screenshot, "image/png")
 
     # 3. dom.html.gz
     if dom is not None:
-        with gzip.open(target / "dom.html.gz", "wb", compresslevel=6) as f:
-            f.write(dom)
+        dom_bytes = gzip.compress(dom, compresslevel=6)
+        await _storage_put(client, supabase_url,
+                           f"{prefix}/dom.html.gz", dom_bytes, "application/gzip")
 
     # 4. meta.json — written LAST = completion marker
     page             = result_json.get("page",     {}) if isinstance(result_json, dict) else {}
@@ -266,10 +323,10 @@ def _write_to_nas(
         "has_screenshot":   screenshot is not None,
         "has_dom":          dom        is not None,
     }
-    (target / "meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
-    )
-    return target
+    meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode()
+    await _storage_put(client, supabase_url,
+                       f"{prefix}/meta.json", meta_bytes, "application/json")
+    return prefix
 
 
 # ═══════════════════════════ DB layer ═══════════════════════════
@@ -396,12 +453,21 @@ async def _do_post(
         return {"row": row, "api_key": api_key, **result}
 
 
-async def _do_poll_and_fetch(
+async def _do_poll_fetch_and_upload(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     pool: UrlscanApiPool,
+    supabase_url: str,
     row: dict,
 ) -> dict:
+    """One coroutine = poll → fetch screenshot/dom → upload 4-pack to Storage.
+
+    Keeping the upload INSIDE the same semaphore slot as poll/fetch bounds the
+    total concurrent network connections to roughly CONCURRENCY × 2 (urlscan
+    GETs concurrent with Supabase PUTs are unlikely but possible). Storage
+    uploads are sequential within a row to keep the meta.json "completion
+    marker" semantics intact (everything else lands first).
+    """
     async with sem:
         # 1. Pre-check timeout (last_fetched_at was set by POST and isn't bumped
         #    by still-queued polls, so its age = "submitted age").
@@ -412,6 +478,7 @@ async def _do_poll_and_fetch(
                 return {"row": row, "outcome": "timeout", "age": age}
 
         api_key = pool.next()
+
         # 2. Poll
         res = await _get_result(client, api_key, row["uuid"])
         if not res.get("ok"):
@@ -420,18 +487,30 @@ async def _do_poll_and_fetch(
             return {"row": row, "outcome": "still_queued", "api_key": api_key}
 
         result_json = res["data"]
-        # 3. On done, fetch screenshot + dom in same coroutine (sequential,
-        #    sharing the semaphore slot — keeps total in-flight bounded).
+        # 3. On done, fetch screenshot + dom (sequential, sharing the slot).
         screenshot = await _get_bytes(client, api_key, f"/screenshots/{row['uuid']}.png")
         dom        = await _get_bytes(client, api_key, f"/dom/{row['uuid']}/")
-        return {
-            "row":         row,
-            "outcome":     "done",
-            "api_key":     api_key,
-            "result_json": result_json,
-            "screenshot":  screenshot,
-            "dom":         dom,
-        }
+
+        # 4. Upload 4-pack to Supabase Storage.
+        try:
+            await _upload_to_storage(
+                client, supabase_url,
+                uuid         = row["uuid"],
+                url_sha256   = row["url_sha256"],
+                url          = row["url"],
+                scan_purpose = row["scan_purpose"],
+                scan_params  = dict(row.get("scan_params") or {}),
+                submitted_at = row.get("last_fetched_at"),
+                api_key_used = api_key,
+                result_json  = result_json,
+                screenshot   = screenshot,
+                dom          = dom,
+            )
+        except Exception as e:
+            return {"row": row, "outcome": "upload_fail", "api_key": api_key,
+                    "error": f"{type(e).__name__}: {e}"}
+
+        return {"row": row, "outcome": "done", "api_key": api_key}
 
 
 # ═══════════════════════════ Phase orchestration ═══════════════════════════
@@ -441,6 +520,7 @@ async def _run_phase_1(
     conn,
     sem: asyncio.Semaphore,
     pool: UrlscanApiPool,
+    supabase_url: str,
     deadline: float,
     counts: dict,
 ) -> None:
@@ -452,7 +532,7 @@ async def _run_phase_1(
         print("  ⚠ deadline already passed before Phase 1 dispatch")
         return
 
-    tasks = [_do_poll_and_fetch(client, sem, pool, r) for r in rows]
+    tasks = [_do_poll_fetch_and_upload(client, sem, pool, supabase_url, r) for r in rows]
     results = await asyncio.gather(*tasks)
 
     abort = next((r for r in results if r.get("abort")), None)
@@ -478,32 +558,19 @@ async def _run_phase_1(
             counts["failed_poll"] += 1
             continue
 
-        # outcome == "done": write NAS first, then mark done.
-        # If NAS write fails, leave DB as-is (next tick retries via the SELECT
-        # because fetch_status is still 'submitted' or we mark failed).
-        try:
-            _write_to_nas(
-                uuid         = r["row"]["uuid"],
-                url_sha256   = r["row"]["url_sha256"],
-                url          = r["row"]["url"],
-                scan_purpose = r["row"]["scan_purpose"],
-                scan_params  = dict(r["row"].get("scan_params") or {}),
-                submitted_at = r["row"].get("last_fetched_at"),
-                api_key_used = r["api_key"],
-                result_json  = r["result_json"],
-                screenshot   = r["screenshot"],
-                dom          = r["dom"],
-            )
-            _apply_poll_done(conn, scan_id)
-            counts["done"] += 1
-        except Exception as e:
-            print(f"  ✗ NAS write failed for scan_id={scan_id}: {type(e).__name__}: {e}")
-            _apply_poll_failure(conn, scan_id, f"NAS write: {type(e).__name__}: {e}")
-            counts["nas_write_fail"] += 1
+        if outcome == "upload_fail":
+            print(f"  ✗ Storage upload failed for scan_id={scan_id}: {r['error']}")
+            _apply_poll_failure(conn, scan_id, f"Storage upload: {r['error']}")
+            counts["storage_upload_fail"] += 1
+            continue
+
+        # outcome == "done"
+        _apply_poll_done(conn, scan_id)
+        counts["done"] += 1
 
     print(f"  → done={counts['done']}  still_queued={counts['polled_pending']}  "
           f"timeout={counts['timeout']}  failed={counts['failed_poll']}  "
-          f"nas_fail={counts['nas_write_fail']}")
+          f"storage_fail={counts['storage_upload_fail']}")
 
 
 async def _run_phase_2(
@@ -541,26 +608,28 @@ async def _run_phase_2(
 
 async def routine_fetch_once_async() -> dict:
     counts = {
-        "polled_pending":  0,
-        "done":            0,
-        "submitted":       0,
-        "failed_post":     0,
-        "failed_poll":     0,
-        "throttled_post":  0,
-        "timeout":         0,
-        "nas_write_fail":  0,
+        "polled_pending":      0,
+        "done":                0,
+        "submitted":           0,
+        "failed_post":         0,
+        "failed_poll":         0,
+        "throttled_post":      0,
+        "timeout":             0,
+        "storage_upload_fail": 0,
     }
 
     pool = _build_pool()
+    supabase_url = _supabase_url()
+    _ = _supabase_service_key()   # fail fast if missing — don't wait for first upload
+
     print(f"=== urlscan fetcher tick @ {datetime.now(timezone.utc).isoformat()} ===")
     print(f"  API pool size:   {pool.size}")
-    print(f"  Data root:       {DATA_ROOT}")
+    print(f"  Supabase base:   {supabase_url}")
+    print(f"  Storage bucket:  {STORAGE_BUCKET}")
     print(f"  Time budget:     {HARD_BUDGET_SEC}s")
     print(f"  Phase 1 limit:   {PHASE_1_LIMIT}")
     print(f"  Phase 2 limit:   {PHASE_2_LIMIT}")
     print(f"  Concurrency:     {CONCURRENCY}")
-
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
     deadline = time.monotonic() + HARD_BUDGET_SEC
     timeout = httpx.Timeout(HTTP_TIMEOUT_SEC, connect=HTTP_CONNECT_TIMEOUT)
@@ -574,7 +643,7 @@ async def routine_fetch_once_async() -> dict:
 
         with get_connection() as conn:
             sem = asyncio.Semaphore(CONCURRENCY)
-            await _run_phase_1(client, conn, sem, pool, deadline, counts)
+            await _run_phase_1(client, conn, sem, pool, supabase_url, deadline, counts)
             if time.monotonic() < deadline:
                 await _run_phase_2(client, conn, sem, pool, deadline, counts)
             else:
@@ -589,7 +658,7 @@ def main() -> None:
     elapsed = time.time() - t0
     print(f"\n=== Summary ({elapsed:.1f}s) ===")
     for k, v in counts.items():
-        print(f"  {k:18}  {v}")
+        print(f"  {k:21}  {v}")
 
 
 if __name__ == "__main__":

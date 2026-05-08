@@ -1,10 +1,12 @@
 # NAS-side urlscan fetcher container.
 #
 # Build context = repository ROOT (uses pyproject.toml + uv.lock + src/...):
-#   docker build -f docker/nas-urlscan-fetcher/Dockerfile \
-#                -t phish-urlscan-fetcher:latest .
+#   docker build -f docker/phishing_intelligence_fetcher/phishing_urlscan_fetcher/Dockerfile \
+#                -t phishing_urlscan_fetcher:latest .
 #
 # Runtime: see ./run.sh for the docker run invocation used by DSM Task Scheduler.
+# Output goes to Supabase Storage (bucket `phishing-urlscan-results`); no host
+# bind mount required.
 
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
@@ -20,8 +22,10 @@ COPY src/__init__.py     ./src/__init__.py
 COPY src/shared/         ./src/shared/
 COPY src/nas_workers/    ./src/nas_workers/
 
-# Run as UID 1026 / GID 100 to match host user 'jxlu'. This makes
-# bind-mounted /data writable without sudo or chown gymnastics.
+# UID 1026 / GID 100 = host 'jxlu', kept for parity with the other
+# phishing_intelligence_fetcher containers. With Storage replacing the bind
+# mount, the UID no longer affects file ownership — but it keeps the
+# convention consistent and is future-proofing.
 RUN useradd -u 1026 -g 100 -m -s /bin/bash fetcher
 USER 1026:100
 
