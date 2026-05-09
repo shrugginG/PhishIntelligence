@@ -1,75 +1,103 @@
 # PhishIntelligence
 
-Multi-source phishing URL intelligence aggregation pipeline → Supabase Postgres.
+Multi-source phishing URL intelligence aggregation pipeline + per-URL enrichment
+(VirusTotal verdicts + urlscan.io rendered scans), funneled into a unified
+Postgres registry that serves as the entry point for an LLM-driven Web Agent.
 
-Aggregates phishing URLs from 5 upstream sources (PhishTank / OpenPhish Academic /
-OpenPhish Community / eCrimeX / PhishStats) into a unified Postgres registry,
-serving as the entry point for an LLM-driven Web Agent that performs deep
-interactive analysis on each URL.
+## Pipeline at a glance
+
+```
+5 raw sources ──┐
+phishtank       │
+openphish_acad  │       trigger
+openphish_comm  ├──▶ phishing_urls (unified registry, deduped, JSONB-merged)
+ecrimex         │           │
+phishstats ─────┘           ├──▶ vt_url_reports     (92-engine verdict, votes, dates)
+                            └──▶ urlscan_url_scans  (UUID + status; 4-pack written to Storage)
+```
 
 ## Stack
 
 - **Python 3.11+** with [uv](https://docs.astral.sh/uv/) for dependency management
-- **psycopg v3** for Postgres (native INET / CIDR / JSONB / TIMESTAMPTZ support)
-- **httpx** for HTTP fetching
-- **GitHub Actions** for cron-driven routine fetching + manual bootstrap/reset
-- **Supabase Postgres** for storage (`raw_*` tables + `phishing_urls` registry)
+- **psycopg v3** for Postgres (native INET / CIDR / JSONB / TIMESTAMPTZ)
+- **httpx** for HTTP fetching (sync for raw, async for VT/urlscan)
+- **Supabase Postgres** as the data backbone — 8 tables + 9 functions + 8 triggers
+- **Supabase Storage** for urlscan 4-pack archive (`phishing-urlscan-results` bucket)
+- **Self-hosted Supabase on NAS** as the v1.3 primary deployment; cloud Supabase as fallback
+- **DSM Task Scheduler** drives 7 cron-style fetcher containers on NAS; **GitHub Actions** mirrors the same 6 cron flows as a parallel fallback
+
+## Schema
+
+`migrations/0001_initial_schema.sql` is the bit-perfect snapshot that any fresh
+Postgres can replay. 8 public-schema tables:
+
+- `raw_phishtank` / `raw_openphish_academic` / `raw_openphish_community` / `raw_ecrimex` / `raw_phishstats` — per-source landing tables
+- `phishing_urls` — cross-source deduped registry; trigger-driven JSONB merge
+- `vt_url_reports` — 1:1 derived; VT engine verdicts
+- `urlscan_url_scans` — 1:N derived; urlscan UUID + status; 4-pack lives in Storage
+
+Detailed field-by-field docs live in `CLAUDE.md` (gitignored, contains
+credentials).
 
 ## Project layout
 
 ```
-src/
-├── shared/                      # cross-source helpers
-│   └── db.py                    # PG connection
-├── sources/                     # one folder per upstream source
-│   ├── phishtank/
-│   ├── openphish_academic/
-│   ├── openphish_community/
-│   ├── ecrimex/
-│   └── phishstats/
-└── reset.py                     # admin: TRUNCATE all tables
-
-.github/workflows/
-├── reset.yml                    # manual + WIPE-ALL confirmation
-├── bootstrap.yml                # manual: seed initial data       (TODO)
-└── fetch_<source>.yml × 5       # cron: routine incremental       (TODO)
+PhishIntelligence/
+├── src/
+│   ├── shared/db.py                          # psycopg connection helper
+│   ├── sources/                              # GH Actions entry points (sync)
+│   │   ├── phishtank.py / openphish_academic.py / openphish_community.py
+│   │   ├── ecrimex.py / phishstats.py
+│   │   ├── vt.py                             # GH-tuned (4h timeout)
+│   │   └── urlscan.py                        # bootstrap-only
+│   ├── nas_workers/                          # NAS-tuned async workers
+│   │   ├── vt_fetcher.py                     # env-driven defaults, HARD_BUDGET_SEC
+│   │   └── urlscan_fetcher.py                # writes Supabase Storage
+│   ├── bootstrap.py / reset.py
+│
+├── docker/phishing_intelligence_fetcher/     # NAS-side fetcher containers
+│   ├── phishing_source_fetcher/              # 5 raw sources, dispatcher entrypoint
+│   ├── phishing_virustotal_fetcher/          # VT enrichment
+│   └── phishing_urlscan_fetcher/             # urlscan + Storage upload
+│
+├── migrations/0001_initial_schema.sql
+└── .github/workflows/                        # parallel fallback (writes cloud DB)
+    ├── bootstrap.yml / reset.yml
+    └── fetch_<source>.yml × 6
 ```
 
 ## Local development
 
 ```bash
-# Install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Sync dependencies (creates .venv and installs from uv.lock)
 uv sync
 
-# Set the Postgres connection string
-export SUPABASE_DB_URL='postgresql://postgres:<pwd>@db.<project>.supabase.co:5432/postgres'
-
-# Run reset locally (careful — will TRUNCATE)
-uv run python -m src.reset
+# Use a Pooler URL (direct db.<ref>.supabase.co is IPv6-only on free tier)
+export SUPABASE_DB_URL='postgresql://postgres.<ref>:<pwd>@aws-0-<region>.pooler.supabase.com:5432/postgres'
+export PHISHTANK_TOKEN='<key>'
+uv run python -m src.sources.phishtank
 ```
 
-## Required GitHub Secrets
+## NAS deployment
 
-Set these in repo settings → Secrets and variables → Actions:
+The NAS-side deployment uses `~/projects/supabase-self-host/` (Supabase docker
+compose) plus `docker/phishing_intelligence_fetcher/<sub>/` per-fetcher images.
+Each fetcher subdir has its own `README.md` with build, .env, and DSM Task
+Scheduler steps. Top-level summary lives in `CLAUDE.md`.
 
-| Secret | Used by | Purpose |
-|---|---|---|
-| `SUPABASE_DB_URL` | all | Postgres connection string — **must be the Session Pooler URL, not direct connection**. Free tier direct connection is IPv6-only and unreachable from GitHub Actions runners. Get the pooler URL from Supabase Dashboard → Database → Connection pooling → Session mode. |
-| `PHISHTANK_TOKEN` | fetch_phishtank | PhishTank bulk dump API key |
-| `ECRIMEX_TOKEN` | fetch_ecrimex | eCrimeX `/api/v1` Bearer token |
-| `OPENPHISH_GITHUB_USER` | fetch_openphish_academic | GitHub username for academic clone |
-| `OPENPHISH_GITHUB_PAT` | fetch_openphish_academic | GitHub PAT for academic clone |
+## Credentials
 
-PhishStats and OpenPhish Community require no credentials.
+Required for full pipeline. Set as either NAS-side `.env` files (`chmod 600`)
+or GitHub Secrets — same names, different stores.
 
-## Schema
+| Variable | Used by |
+|---|---|
+| `SUPABASE_DB_URL` | All fetchers |
+| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | urlscan fetcher (Storage writes) |
+| `PHISHTANK_TOKEN` | phishtank source |
+| `ECRIMEX_TOKEN` | ecrimex source |
+| `OPENPHISH_GITHUB_USER` + `OPENPHISH_GITHUB_PAT` | openphish_academic source (60-day expiry) |
+| `VIRUSTOTAL_ACADEMIC_API_KEY` | vt enrichment |
+| `URLSCAN_API_KEYS` (comma-separated) | urlscan enrichment |
 
-Detailed schema docs and DDL are kept in `CLAUDE.md` (gitignored — contains
-credentials). The Supabase project's `public` schema has 6 tables:
-`raw_phishtank`, `raw_openphish_academic`, `raw_openphish_community`,
-`raw_ecrimex`, `raw_phishstats`, plus the unified `phishing_urls` registry.
-Five trigger functions on the `raw_*` tables auto-derive the `phishing_urls`
-state on every INSERT/UPDATE.
+PhishStats and OpenPhish Community need no credentials.
