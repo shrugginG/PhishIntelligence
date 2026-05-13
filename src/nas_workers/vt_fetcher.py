@@ -101,6 +101,27 @@ def _extract_vt_id(analysis_id: str) -> str | None:
 
 # ═══════════════════════════ HTTP layer (async) ═══════════════════════════
 
+# VT uses 403 ambiguously: per-URL ("Private URL" via ForbiddenError) vs
+# global ("UserNotActiveError", "WrongCredentialsError"). Treating all 403 as
+# global once caused a single Private URL at the queue head to abort every
+# Phase 2 for 28h.
+_GLOBAL_403_CODES = frozenset({"UserNotActiveError", "WrongCredentialsError"})
+
+
+def _classify_http_error(r: httpx.Response) -> dict:
+    msg = f"HTTP {r.status_code}: {r.text[:200]}"
+    if r.status_code == 401:
+        return {"ok": False, "abort": True, "error": msg}
+    if r.status_code == 403:
+        try:
+            code = r.json().get("error", {}).get("code", "")
+        except Exception:
+            code = ""
+        if code in _GLOBAL_403_CODES:
+            return {"ok": False, "abort": True, "error": msg}
+    return {"ok": False, "error": msg}
+
+
 async def _check_quota(client: httpx.AsyncClient) -> bool:
     """Return True if OK to proceed, False if user-daily usage > QUOTA_ABORT_RATIO."""
     url = f"{API_BASE}/users/{_api_key()}/overall_quotas"
@@ -127,10 +148,7 @@ async def _vt_post(client: httpx.AsyncClient, url: str) -> dict:
             j = r.json()
             aid = j["data"]["id"]
             return {"ok": True, "analysis_id": aid, "vt_id": _extract_vt_id(aid)}
-        if r.status_code in (401, 403):
-            return {"ok": False, "abort": True,
-                    "error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        return _classify_http_error(r)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -143,10 +161,7 @@ async def _vt_get_analysis(client: httpx.AsyncClient, analysis_id: str) -> dict:
         if r.status_code == 200:
             attrs = r.json()["data"]["attributes"]
             return {"ok": True, "status": attrs.get("status")}
-        if r.status_code in (401, 403):
-            return {"ok": False, "abort": True,
-                    "error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        return _classify_http_error(r)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -158,10 +173,7 @@ async def _vt_get_url_report(client: httpx.AsyncClient, vt_id: str) -> dict:
         r = await client.get(api, headers=_headers())
         if r.status_code == 200:
             return {"ok": True, "data": r.json()["data"]}
-        if r.status_code in (401, 403):
-            return {"ok": False, "abort": True,
-                    "error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        return _classify_http_error(r)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
