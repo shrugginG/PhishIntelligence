@@ -8,7 +8,7 @@ ACTION="${1:-}"
 shift || true
 
 case "$ACTION" in
-  phishtank|openphish_academic|openphish_community|ecrimex|phishstats|phishunt)
+  phishtank|openphish_academic|openphish_community|ecrimex|phishstats|phishunt|tweetfeed)
     exec uv run python -m "src.sources.${ACTION}"
     ;;
   bootstrap)
@@ -20,14 +20,14 @@ case "$ACTION" in
   "")
     cat <<EOF >&2
 Usage: <action> [args...]
-  Source actions: phishtank | openphish_academic | openphish_community | ecrimex | phishstats | phishunt
+  Source actions: phishtank | openphish_academic | openphish_community | ecrimex | phishstats | phishunt | tweetfeed
   Manual actions: bootstrap [--targets ...] | reset
 EOF
     exit 2
     ;;
   *)
     echo "Unknown action: $ACTION" >&2
-    echo "Valid: phishtank, openphish_academic, openphish_community, ecrimex, phishstats, phishunt, bootstrap, reset" >&2
+    echo "Valid: phishtank, openphish_academic, openphish_community, ecrimex, phishstats, phishunt, tweetfeed, bootstrap, reset" >&2
     exit 2
     ;;
 esac
