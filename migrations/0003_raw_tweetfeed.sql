@@ -12,19 +12,22 @@
 -- DELIBERATELY ISOLATED: like raw_phishunt, NO propagation trigger into
 -- phishing_urls — writes stay out of the vt/urlscan pipeline until we decide.
 --
--- url_sha256 PK with multi-valued fields as arrays: a single URL may be tweeted
--- by multiple users over time, so users/tags/tweets accumulate as deduped sets
--- across sightings (UPSERT array-union). The exact per-sighting (date,user,
--- tags,tweet) tuples are preserved losslessly in raw_payload (array of entries).
+-- url_sha256 PK; a single URL may be tweeted by multiple users, and a single
+-- user may tweet the same URL multiple times (1:N). So provenance is stored as
+-- `reporters JSONB` = {user: [tweet_url, ...]} — keyed by reporter, value is the
+-- list of that reporter's tweets about this URL. Merged across sightings by
+-- deep JSONB union. The exact per-sighting (date,user,tags,tweet) tuples are
+-- preserved losslessly in raw_payload (array of entries).
 
 CREATE TABLE raw_tweetfeed (
   url_sha256        TEXT        PRIMARY KEY CHECK (length(url_sha256) = 64),
   url               TEXT        NOT NULL,
 
-  -- multi-valued: accumulated across sightings as deduped sets
-  users             TEXT[]      NOT NULL DEFAULT '{}',   -- everyone who reported this URL
-  tags              TEXT[]      NOT NULL DEFAULT '{}',   -- union of tags (normalized: lowercase, no '#')
-  tweets            TEXT[]      NOT NULL DEFAULT '{}',   -- source tweet URLs (provenance)
+  -- provenance: {user: [tweet_url, ...]} (who reported this URL via which tweets)
+  reporters         JSONB       NOT NULL DEFAULT '{}'::jsonb,
+
+  -- tags: union across sightings (normalized: lowercase, no '#')
+  tags              TEXT[]      NOT NULL DEFAULT '{}',
 
   -- source times (aggregated over per-sighting `date`)
   first_seen        TIMESTAMPTZ,                         -- min(date): earliest community report
@@ -38,6 +41,7 @@ CREATE TABLE raw_tweetfeed (
 CREATE INDEX ix_raw_tweetfeed_first_seen  ON raw_tweetfeed (first_seen DESC);
 CREATE INDEX ix_raw_tweetfeed_ingested_at ON raw_tweetfeed (ingested_at DESC);
 CREATE INDEX ix_raw_tweetfeed_tags        ON raw_tweetfeed USING GIN (tags);
+CREATE INDEX ix_raw_tweetfeed_reporters   ON raw_tweetfeed USING GIN (reporters);  -- reporters ? 'user'
 
 -- NOTE: intentionally NO `CREATE TRIGGER ... propagate`. raw_tweetfeed is
 -- observed in isolation until we decide whether/how to promote it.
