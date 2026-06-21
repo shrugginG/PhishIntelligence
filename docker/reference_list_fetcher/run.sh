@@ -8,21 +8,24 @@
 #
 # All paths absolute, no $HOME / $PATH assumptions (DSM runs as root; $HOME=/root).
 #
-# OS-level hard kill = 600s. The v2fly sync downloads a few-MB tarball, parses
-# ~37k rules and UPSERTs them — normally <60s. 600s gives ample margin.
+# OS-level hard kill = 1200s. v2fly/tranco normally finish in <60s; the ceiling
+# is sized for crux's monthly run, which (when a new CrUX month appears) pulls
+# global + 238 country files (~215 MB) and archives them to Storage — a few
+# minutes. Daily crux runs are a no-op (one API call). The ceiling is a max, not
+# a wait, so it doesn't slow the fast actions.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOCKER_BIN="/usr/local/bin/docker"
 IMAGE="reference_list_fetcher:latest"
-HARD_KILL_SEC=600
+HARD_KILL_SEC=1200
 
 ACTION="${1:-}"
 if [[ -z "$ACTION" ]]; then
   cat <<EOF >&2
 Usage: $0 <action> [args...]
-  source actions: v2fly
+  source actions: v2fly | tranco | crux
   manual actions: reset WIPE-REFERENCE
 EOF
   exit 2

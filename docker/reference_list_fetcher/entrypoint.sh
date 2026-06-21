@@ -14,20 +14,23 @@ case "$ACTION" in
   tranco)
     exec uv run python -m src.sources.reference.tranco
     ;;
+  crux)
+    exec uv run python -m src.sources.reference.crux
+    ;;
   reset)
     exec uv run python -m src.sources.reference.reset "$@"
     ;;
   "")
     cat <<EOF >&2
 Usage: <action> [args...]
-  Source actions: v2fly | tranco
+  Source actions: v2fly | tranco | crux
   Manual actions: reset
 EOF
     exit 2
     ;;
   *)
     echo "Unknown action: $ACTION" >&2
-    echo "Valid: v2fly, tranco, reset" >&2
+    echo "Valid: v2fly, tranco, crux, reset" >&2
     exit 2
     ;;
 esac
