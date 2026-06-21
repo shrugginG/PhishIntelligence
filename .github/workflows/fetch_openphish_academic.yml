@@ -27,7 +27,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run OpenPhish Academic routine fetch
-        run: uv run python -m src.sources.openphish_academic
+        run: uv run python -m src.sources.phishing.openphish_academic
         env:
           SUPABASE_DB_URL:        ${{ secrets.SUPABASE_DB_URL }}
           OPENPHISH_GITHUB_USER:  ${{ secrets.OPENPHISH_GITHUB_USER }}

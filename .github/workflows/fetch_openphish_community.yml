@@ -26,6 +26,6 @@ jobs:
         run: uv sync --frozen
 
       - name: Run OpenPhish Community routine fetch
-        run: uv run python -m src.sources.openphish_community
+        run: uv run python -m src.sources.phishing.openphish_community
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}

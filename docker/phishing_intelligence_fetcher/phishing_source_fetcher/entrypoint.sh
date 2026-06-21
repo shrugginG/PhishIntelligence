@@ -9,7 +9,7 @@ shift || true
 
 case "$ACTION" in
   phishtank|openphish_academic|openphish_community|ecrimex|phishstats|phishunt|tweetfeed)
-    exec uv run python -m "src.sources.${ACTION}"
+    exec uv run python -m "src.sources.phishing.${ACTION}"
     ;;
   bootstrap)
     exec uv run python -m src.bootstrap "$@"

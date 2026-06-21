@@ -28,7 +28,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run eCrimeX routine fetch
-        run: uv run python -m src.sources.ecrimex
+        run: uv run python -m src.sources.phishing.ecrimex
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           ECRIMEX_TOKEN:   ${{ secrets.ECRIMEX_TOKEN }}

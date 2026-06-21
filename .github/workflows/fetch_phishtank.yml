@@ -26,7 +26,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run PhishTank routine fetch
-        run: uv run python -m src.sources.phishtank
+        run: uv run python -m src.sources.phishing.phishtank
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           PHISHTANK_TOKEN: ${{ secrets.PHISHTANK_TOKEN }}

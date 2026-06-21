@@ -61,7 +61,7 @@ def _parse_targets(s: str) -> list[str]:
 def _run_one(target: str, size: int | None) -> tuple[str, int | str]:
     """Returns ('ok', n_affected) or ('failed', error_message)."""
     try:
-        module = importlib.import_module(f"src.sources.{target}")
+        module = importlib.import_module(f"src.sources.phishing.{target}")
         affected = module.bootstrap_fetch(size=size)
         return ("ok", affected)
     except Exception as e:

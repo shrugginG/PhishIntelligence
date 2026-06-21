@@ -32,7 +32,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run VT routine fetch
-        run: uv run python -m src.sources.vt
+        run: uv run python -m src.sources.phishing.vt
         env:
           SUPABASE_DB_URL:              ${{ secrets.SUPABASE_DB_URL }}
           VIRUSTOTAL_ACADEMIC_API_KEY:  ${{ secrets.VIRUSTOTAL_ACADEMIC_API_KEY }}
