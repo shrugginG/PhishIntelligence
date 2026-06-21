@@ -9,36 +9,54 @@ JOIN-able with `public.phishing_urls`.
 
 ## Sources
 
-| action | source | tables |
+| action | source | tables / storage |
 |---|---|---|
 | `v2fly` | [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) raw `data/` dir | `reference.v2fly_domain_rules`, `reference.v2fly_list_includes`, `reference.v2fly_sync_runs` |
+| `tranco` | [Tranco](https://tranco-list.eu/) top-1M (both granularities) | `reference.tranco_top1m`, `reference.tranco_archive` + Storage bucket `tranco-archive` |
 
-(future: `tranco`, `crux`)
+(future: `crux`)
 
-We ingest the **raw source** `data/` directory (NOT the compiled `dlc.dat`),
-preserving the include graph, attributes, affiliations and inline comments.
-Resolution / allowlist curation is deferred to downstream workflows.
+## Refresh models (per source)
 
-## Refresh model
+**v2fly** — raw `data/` dir (NOT the compiled `dlc.dat`), preserving include
+graph / attributes / affiliations / inline comments. Snapshot + last_seen (same
+as `raw_phishunt`): commit-pinned tarball → UPSERT full set → bump `last_seen_at`
+/ `sync_count` / `source_commit`; vanished rows kept (source_commit stops). One
+`v2fly_sync_runs` row per fetch.
 
-Snapshot + last_seen (same as `raw_phishunt`): each sync pulls a
-**commit-pinned** tarball, UPSERTs the full set, bumps `last_seen_at` /
-`sync_count` / `source_commit`. Rows that drop out of upstream are NOT deleted;
-their `source_commit` stops advancing (→ "vanished upstream"). One
-`v2fly_sync_runs` row records provenance + churn per fetch.
+**tranco** — Strategy A (current-mirror) + cold Storage archive, NO history in PG:
+- HOT `tranco_top1m`: current-only mirror of the latest top-1M, BOTH
+  granularities (`subdomains` flag). Refreshed via TRUNCATE+COPY → the table IS
+  the latest list (no `current` flag, zero bloat).
+- COLD bucket `tranco-archive`: each day's raw `.csv.zip` (both granularities),
+  immutable, keyed by `<date>__<list_id>`. `tranco_archive` manifest catalogs it.
+- Idempotent on Tranco's permanent `list_id`; a tick whose list_ids are already
+  archived is a no-op (Tranco updates 1×/day, we tick 3×/day).
 
 ## Setup (NAS)
 
 ```bash
 cd ~/projects/PhishIntelligence/docker/reference_list_fetcher
-cp .env.example .env && chmod 600 .env   # then fill SUPABASE_DB_URL
+cp .env.example .env && chmod 600 .env
+# fill SUPABASE_DB_URL (all sources) + SUPABASE_URL & SUPABASE_SERVICE_ROLE_KEY (tranco Storage)
 ```
 
-Apply the schema once (NAS-first; cloud optional):
+Apply the schemas once (NAS-first; cloud optional):
 
 ```bash
-sudo /usr/local/bin/docker exec -i supabase-db psql -U postgres -d postgres \
-  < ~/projects/PhishIntelligence/migrations/0004_reference_schema.sql
+for m in 0004_reference_schema 0005_reference_tranco; do
+  sudo /usr/local/bin/docker exec -i supabase-db psql -U postgres -d postgres \
+    < ~/projects/PhishIntelligence/migrations/$m.sql
+done
+```
+
+Create the Tranco cold-archive bucket once (private; service role only):
+
+```bash
+SK=$(grep ^SERVICE_ROLE_KEY ~/projects/supabase-self-host/.env | cut -d= -f2)
+curl -s -X POST "http://192.168.1.161:8000/storage/v1/bucket" \
+  -H "apikey: $SK" -H "Authorization: Bearer $SK" -H "Content-Type: application/json" \
+  -d '{"id":"tranco-archive","name":"tranco-archive","public":false}'
 ```
 
 Build the image (from repo root):
@@ -52,17 +70,19 @@ sudo /usr/local/bin/docker build -f docker/reference_list_fetcher/Dockerfile \
 ## Run
 
 ```bash
-./run.sh v2fly                 # one sync (DSM calls this)
-./run.sh reset WIPE-REFERENCE  # TRUNCATE reference.v2fly_* (destructive)
+./run.sh v2fly                 # one v2fly sync
+./run.sh tranco                # one tranco sync (DB + Storage)
+./run.sh reset WIPE-REFERENCE  # TRUNCATE all reference.* tables (NOT the Storage bucket)
 ```
 
 ## DSM Task Scheduler
 
-One task, **every 8 hours (3×/day)**:
+Two tasks, each **every 8 hours (3×/day)**:
 
 | task name | schedule | command |
 |---|---|---|
-| `reference_list_fetcher_v2fly` | 00:00 / 08:00 / 16:00 | `.../reference_list_fetcher/run.sh v2fly` |
+| `reference_list_fetcher_v2fly`  | 00:00 / 08:00 / 16:00 | `.../reference_list_fetcher/run.sh v2fly` |
+| `reference_list_fetcher_tranco` | 02:00 / 10:00 / 18:00 | `.../reference_list_fetcher/run.sh tranco` |
 
 `--name` lock + `timeout --kill-after=30 600` wrapper, same robustness pattern as
-the phishing fetchers.
+the phishing fetchers. (Offset tranco off v2fly's :00 to avoid the cron cluster.)

@@ -1,9 +1,13 @@
-"""Reset the reference-schema v2fly tables.
+"""Reset the reference-schema tables (v2fly + tranco).
 
 Scoped to the `reference` schema ONLY — does NOT touch the phishing pipeline
 (that's `src/reset.py`). The user-facing safety check (typing 'WIPE-REFERENCE')
 lives in docker/reference_list_fetcher/run.sh; by the time this script runs the
 wrapper has already validated it.
+
+NOTE: this TRUNCATEs DB tables only. The Tranco cold archive in the
+`tranco-archive` Storage bucket is NOT cleared (same caveat as the urlscan
+results bucket) — delete those objects separately if a full wipe is intended.
 
 Behavior:
   1. Print row count of every target table BEFORE truncate (audit log)
@@ -17,6 +21,8 @@ TABLES = [
     "reference.v2fly_domain_rules",
     "reference.v2fly_list_includes",
     "reference.v2fly_sync_runs",
+    "reference.tranco_top1m",
+    "reference.tranco_archive",
 ]
 
 
