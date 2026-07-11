@@ -7,6 +7,14 @@ Source `hash` field has been verified == sha256(url), so we reuse it as
 url_sha256 directly (defensive recompute on missing).
 
 This source has the richest schema (45 columns).
+
+Incremental resilience (2026-07): the routine now UPSERTs **per page** and
+handles HTTP 429 with backoff. Records are `_sort=-id` (newest first), so each
+page that lands advances `MAX(id)` toward the current head. This guarantees the
+anchor makes forward progress even if a later page 429s or the OS-level timeout
+kills the process mid-run — avoiding the old "fetch-all-then-insert" trap where
+a single 429 discarded the whole batch and the anchor never moved (stale anchor
+→ every run needs >9 pages → page-10 429 → 0 rows → permanently stuck).
 """
 
 from __future__ import annotations
@@ -20,38 +28,42 @@ import httpx
 from src.shared.db import get_connection
 
 API_URL = "https://api.phishstats.info/api/phishing"
-PAGE_SIZE = 100         # API max per page
+PAGE_SIZE = 100          # API max per page
 MAX_PAGES_SAFETY = 100
-INTER_PAGE_DELAY = 3.0  # 20 req/min ≈ 3s/req; conservative pause between pages
+INTER_PAGE_DELAY = 4.0   # keep strictly under the 20 req/min limit (3s == the limit)
+MAX_429_RETRIES = 5      # per-page backoff attempts before giving up (partial progress)
+BACKOFF_BASE = 5.0       # initial 429 backoff seconds (doubles, capped)
+BACKOFF_CAP = 60.0
 
 
-def _fetch(size: int | None) -> list[dict]:
-    records: list[dict] = []
-    with httpx.Client(timeout=60) as client:
-        for page in range(1, MAX_PAGES_SAFETY + 1):
-            need = PAGE_SIZE if size is None else min(PAGE_SIZE, size - len(records))
-            if need <= 0:
-                break
+def _get_page(client: httpx.Client, page: int, size: int) -> list[dict] | None:
+    """GET one API page, sorted id desc.
 
-            resp = client.get(
-                API_URL,
-                params={"_p": page, "_size": need, "_sort": "-id"},
-            )
-            resp.raise_for_status()
-            batch = resp.json()
-            if not batch:
-                break
+    Returns the parsed batch (possibly empty) on success. Returns ``None`` if the
+    request keeps returning HTTP 429 past ``MAX_429_RETRIES`` — the caller should
+    then stop paging and keep whatever earlier pages already landed. Non-429 HTTP
+    errors still raise (genuine failures we want to surface).
+    """
+    delay = BACKOFF_BASE
+    for attempt in range(1, MAX_429_RETRIES + 1):
+        resp = client.get(
+            API_URL,
+            params={"_p": page, "_size": size, "_sort": "-id"},
+        )
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if (retry_after or "").isdigit() else delay
+            print(f"  page {page}: 429, backoff {wait:.0f}s "
+                  f"(attempt {attempt}/{MAX_429_RETRIES})")
+            time.sleep(wait)
+            delay = min(delay * 2, BACKOFF_CAP)
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
-            records.extend(batch)
-            print(f"  page {page} → {len(batch)} records (total {len(records)})")
-
-            if size is not None and len(records) >= size:
-                records = records[:size]
-                break
-
-            time.sleep(INTER_PAGE_DELAY)
-
-    return records
+    print(f"  page {page}: still 429 after {MAX_429_RETRIES} retries — "
+          f"stopping with partial progress")
+    return None
 
 
 def _scrub_null_bytes(obj):
@@ -68,10 +80,7 @@ def _scrub_null_bytes(obj):
     return obj
 
 
-def _upsert(records: list[dict]) -> int:
-    if not records:
-        return 0
-
+def _rows_from_records(records: list[dict]) -> list[tuple]:
     # Defensive: PhishStats records may contain null bytes (esp. in page_text);
     # PG JSONB and TEXT can't represent them.
     records = [_scrub_null_bytes(r) for r in records]
@@ -129,53 +138,84 @@ def _upsert(records: list[dict]) -> int:
                 json.dumps(r, ensure_ascii=False),
             )
         )
+    return rows
 
-    sql = """
-        INSERT INTO raw_phishstats (
-            id, url, url_sha256, redirect_url,
-            ip, bgp, asn, isp, ports,
-            http_code, http_server, os, technology,
-            country_code, country_name, region_code, region_name,
-            city, zipcode, latitude, longitude,
-            host, domain, tld, title,
-            ssl_issuer, ssl_subject, ssl_fingerprint,
-            score, google_safebrowsing, virus_total, abuse_ch_malware,
-            vulns, tags, abuse_contact, screenshot,
-            domain_registered_n_days_ago,
-            rank_host, rank_domain,
-            n_times_seen_ip, n_times_seen_host, n_times_seen_domain,
-            discovered_at, updated_at,
-            raw_payload
-        ) VALUES (
-            %s, %s, %s, %s,
-            %s::inet, %s::cidr, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s,
-            %s, %s,
-            %s, %s, %s,
-            %s::timestamptz, %s::timestamptz,
-            %s::jsonb
-        )
-        ON CONFLICT (id) DO NOTHING
-    """
 
+_INSERT_SQL = """
+    INSERT INTO raw_phishstats (
+        id, url, url_sha256, redirect_url,
+        ip, bgp, asn, isp, ports,
+        http_code, http_server, os, technology,
+        country_code, country_name, region_code, region_name,
+        city, zipcode, latitude, longitude,
+        host, domain, tld, title,
+        ssl_issuer, ssl_subject, ssl_fingerprint,
+        score, google_safebrowsing, virus_total, abuse_ch_malware,
+        vulns, tags, abuse_contact, screenshot,
+        domain_registered_n_days_ago,
+        rank_host, rank_domain,
+        n_times_seen_ip, n_times_seen_host, n_times_seen_domain,
+        discovered_at, updated_at,
+        raw_payload
+    ) VALUES (
+        %s, %s, %s, %s,
+        %s::inet, %s::cidr, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s,
+        %s, %s,
+        %s, %s, %s,
+        %s::timestamptz, %s::timestamptz,
+        %s::jsonb
+    )
+    ON CONFLICT (id) DO NOTHING
+"""
+
+
+def _upsert(records: list[dict]) -> int:
+    if not records:
+        return 0
+    rows = _rows_from_records(records)
     with get_connection() as conn, conn.cursor() as cur:
-        cur.executemany(sql, rows)
+        cur.executemany(_INSERT_SQL, rows)
         return cur.rowcount
 
 
 def bootstrap_fetch(size: int | None) -> int:
-    records = _fetch(size)
-    print(f"  Fetched {len(records)} records")
-    affected = _upsert(records)
-    print(f"  Insert affected {affected} rows")
-    return affected
+    """Bounded fetch (no anchor). Pages up to `size`, UPSERTing per page so
+    progress survives a mid-run 429 / timeout.
+    """
+    total = 0
+    fetched = 0
+    with httpx.Client(timeout=60) as client:
+        for page in range(1, MAX_PAGES_SAFETY + 1):
+            need = PAGE_SIZE if size is None else min(PAGE_SIZE, size - fetched)
+            if need <= 0:
+                break
+
+            batch = _get_page(client, page, need)
+            if batch is None:      # 429 exhausted → keep partial progress
+                break
+            if not batch:
+                break
+
+            fetched += len(batch)
+            affected = _upsert(batch)
+            total += affected
+            print(f"  page {page}: {len(batch)} fetched, {affected} inserted "
+                  f"(total {total})")
+
+            if size is not None and fetched >= size:
+                break
+            time.sleep(INTER_PAGE_DELAY)
+
+    print(f"  Insert affected {total} rows")
+    return total
 
 
 def _get_anchor() -> int:
@@ -185,46 +225,42 @@ def _get_anchor() -> int:
         return cur.fetchone()[0]
 
 
-def _fetch_since(anchor: int) -> list[dict]:
-    """Paginate API by id desc, short-circuit when a page contains any
-    record with id <= anchor (PhishStats `_sort=-id` is strict desc).
+def routine_fetch() -> int:
+    """Incremental fetch: paginate API for id > anchor, UPSERTing **per page**.
+
+    Because rows are newest-first, each landed page pushes `MAX(id)` forward, so
+    the anchor advances even if a later page 429s or the process is killed. Stops
+    on: a page containing any record <= anchor (subsequent pages are older),
+    an empty page, or 429 exhaustion (partial progress preserved).
     """
-    records: list[dict] = []
+    anchor = _get_anchor()
+    print(f"  Anchor: id > {anchor}")
+
+    total = 0
     last_page = 0
     with httpx.Client(timeout=60) as client:
         for page in range(1, MAX_PAGES_SAFETY + 1):
             last_page = page
-            resp = client.get(
-                API_URL,
-                params={"_p": page, "_size": PAGE_SIZE, "_sort": "-id"},
-            )
-            resp.raise_for_status()
-            batch = resp.json()
+            batch = _get_page(client, page, PAGE_SIZE)
+            if batch is None:      # 429 exhausted → keep what already landed
+                break
             if not batch:
                 break
 
             new_in_batch = [r for r in batch if r["id"] > anchor]
-            records.extend(new_in_batch)
-            print(f"  page {page}: {len(batch)} fetched, {len(new_in_batch)} > anchor")
+            affected = _upsert(new_in_batch)
+            total += affected
+            print(f"  page {page}: {len(batch)} fetched, "
+                  f"{len(new_in_batch)} > anchor, {affected} inserted")
 
-            # Short-circuit: any record <= anchor means subsequent pages are even older
+            # Short-circuit: any record <= anchor means subsequent pages are older
             if len(new_in_batch) < len(batch):
                 break
 
             time.sleep(INTER_PAGE_DELAY)
 
-    print(f"  Total over {last_page} page(s): {len(records)}")
-    return records
-
-
-def routine_fetch() -> int:
-    """Incremental fetch: paginate API for id > anchor."""
-    anchor = _get_anchor()
-    print(f"  Anchor: id > {anchor}")
-    records = _fetch_since(anchor)
-    affected = _upsert(records)
-    print(f"  Insert affected {affected} rows")
-    return affected
+    print(f"  Total inserted over {last_page} page(s): {total}")
+    return total
 
 
 if __name__ == "__main__":
