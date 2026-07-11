@@ -17,7 +17,7 @@ The actual fetch logic lives in `src/nas_workers/urlscan_fetcher.py`.
 ssh nas
 SERVICE_KEY=$(grep ^SERVICE_ROLE_KEY ~/projects/supabase-self-host/.env | cut -d= -f2)
 
-curl -s -X POST "http://192.168.1.161:8000/storage/v1/bucket" \
+curl -s -X POST "http://192.168.1.21:8000/storage/v1/bucket" \
   -H "apikey: $SERVICE_KEY" \
   -H "Authorization: Bearer $SERVICE_KEY" \
   -H "Content-Type: application/json" \
@@ -104,7 +104,7 @@ Use Studio Storage GUI to drill into the bucket, OR via API:
 SERVICE_KEY=$(grep ^SERVICE_ROLE_KEY ~/projects/supabase-self-host/.env | cut -d= -f2)
 SHA=<url_sha256>
 UUID=<scan-uuid>
-BASE="http://192.168.1.161:8000/storage/v1/object/phishing-urlscan-results"
+BASE="http://192.168.1.21:8000/storage/v1/object/phishing-urlscan-results"
 
 # meta.json (small, JSON)
 curl -s -H "apikey: $SERVICE_KEY" "$BASE/$SHA/$UUID/meta.json" | jq .

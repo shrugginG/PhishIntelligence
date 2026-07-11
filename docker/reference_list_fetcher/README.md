@@ -65,7 +65,7 @@ Create the cold-archive buckets once (private; service role only):
 ```bash
 SK=$(grep ^SERVICE_ROLE_KEY ~/projects/supabase-self-host/.env | cut -d= -f2)
 for b in tranco-archive crux-top-archive; do
-  curl -s -X POST "http://192.168.1.161:8000/storage/v1/bucket" \
+  curl -s -X POST "http://192.168.1.21:8000/storage/v1/bucket" \
     -H "apikey: $SK" -H "Authorization: Bearer $SK" -H "Content-Type: application/json" \
     -d "{\"id\":\"$b\",\"name\":\"$b\",\"public\":false}"
 done

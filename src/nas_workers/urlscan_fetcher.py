@@ -126,7 +126,7 @@ def _supabase_url() -> str:
     if not v:
         raise RuntimeError(
             "SUPABASE_URL not set. Point at the Kong gateway: "
-            "self-host = http://192.168.1.161:8000, "
+            "self-host = http://192.168.1.21:8000, "
             "cloud = https://<ref>.supabase.co"
         )
     return v.rstrip("/")

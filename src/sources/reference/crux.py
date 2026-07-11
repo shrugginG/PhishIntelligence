@@ -95,7 +95,7 @@ def _download_raw(client: httpx.Client, repo_path: str) -> bytes:
 def _supabase_url() -> str:
     v = os.environ.get("SUPABASE_URL")
     if not v:
-        raise RuntimeError("SUPABASE_URL not set (Kong gateway; self-host = http://192.168.1.161:8000)")
+        raise RuntimeError("SUPABASE_URL not set (Kong gateway; self-host = http://192.168.1.21:8000)")
     return v.rstrip("/")
 
 
